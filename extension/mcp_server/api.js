@@ -3912,13 +3912,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
 	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-	                        const quotedLines = originalBody.split('\n').map(line =>
-	                          `&gt; ${escapeHtml(line)}`
-	                        ).join('<br>');
-	                        const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                        const quoteBlock = isHtml
-	                          ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                          : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
+	                        const origRecip = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+	                        const origSubj = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+	                        const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
+
+	                        const quoteBlock = `<br><hr tabindex="-1" style="display:inline-block; width:98%"><div dir="ltr"><font face="Calibri, sans-serif" style="font-size:11pt" color="#000000"><b>From:</b> ${escapeHtml(author)}<br><b>Sent:</b> ${dateStr}<br><b>To:</b> ${escapeHtml(origRecip)}<br><b>Subject:</b> ${escapeHtml(origSubj)}</font></div><br>${escapedBody}`;
 
 	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
 	                        // it still uses a hand-built quoted body and cannot place the

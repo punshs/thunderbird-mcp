@@ -3082,6 +3082,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
+              skipReview = false; // Force user approval
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -4868,10 +4869,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
             function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
+              skipReview = false; // Force user approval
               try {
-                if (skipReview && isSkipReviewBlocked()) {
-                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
-                }
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -4899,7 +4898,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const formatted = formatBodyHtml(body, isHtml);
                   composeFields.body = isHtml && formatted.includes('<html')
                     ? formatted
-                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
+                    : `<html><head><meta charset="UTF-8"></head><body><div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;">${formatted}</div></body></html>`;
                 } else {
                   composeFields.body = body || "";
                 }
@@ -5000,6 +4999,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * and manually marks the original as replied after a successful send.
              */
 	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
+	              skipReview = false; // Force user approval
 	              return new Promise((resolve) => {
 	                try {
 	                  if (skipReview && isSkipReviewBlocked()) {
@@ -5090,14 +5090,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                        // for a plain-format send would otherwise render as literal
 	                        // markup in the recipient's mail client.
 	                        if (replyUseHtml) {
-	                          const quotedLines = originalBody.split('\n').map(line =>
-	                            `&gt; ${escapeHtml(line)}`
-	                          ).join('<br>');
-	                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                          const quoteBlock = isHtml
-	                            ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                            : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+	                          const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+	                          const fwdSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+	                          const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
+
+	                          const quoteBlock = `<br><hr tabindex="-1" style="display: inline-block; width:98%"><div id="divRplyFwdMsg" dir="ltr"><div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;"><b>From:</b> ${escapeHtml(author)}<br><b>Sent:</b> ${dateStr}<br><b>To:</b> ${escapeHtml(fwdRecipients)}<br><b>Subject:</b> ${escapeHtml(fwdSubject)}</div><div>&nbsp;</div><div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;">${escapedBody}</div></div>`;
+
+	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body><div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;">${formatBodyHtml(body, isHtml)}</div>${quoteBlock}</body></html>`;
 	                        } else {
 	                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
 	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
@@ -5166,6 +5165,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * marks the original as forwarded after a successful send.
              */
             function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+              skipReview = false; // Force user approval
               return new Promise((resolve) => {
                 try {
                   if (skipReview && isSkipReviewBlocked()) {
@@ -5238,20 +5238,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // plain-format send would render as literal markup in the
                         // recipient's mail client.
                         if (fwdUseHtml) {
-                          const fwdHeaderHtml =
-                            `-------- Forwarded Message --------<br>` +
+                          const forwardBlock = `<div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;">-------- Forwarded Message --------<br>` +
                             `Subject: ${escapeHtml(origSubject)}<br>` +
                             `Date: ${dateStr}<br>` +
                             `From: ${escapeHtml(fwdAuthor)}<br>` +
-                            `To: ${escapeHtml(fwdRecipients)}<br><br>`;
-                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-                          const quotedLinesHtml = originalBody.split('\n').map(line =>
-                            `&gt; ${escapeHtml(line)}`
-                          ).join('<br>');
-                          const forwardBlock = isHtml
-                            ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
-                            : `${fwdHeaderHtml}${quotedLinesHtml}`;
-                          const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+                            `To: ${escapeHtml(fwdRecipients)}<br><br>` +
+                            `${escapeHtml(originalBody).replace(/\n/g, '<br>')}</div>`;
+
+                          const introHtml = body ? `<div style="font-family: Aptos, Calibri, sans-serif; font-size: 11pt; color: #000000;">${formatBodyHtml(body, isHtml)}</div><br><br>` : "";
                           composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
                         } else {
                           const fwdHeader =

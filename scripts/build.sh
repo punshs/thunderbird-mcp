@@ -11,28 +11,7 @@ PACKAGE_JSON="$PROJECT_DIR/package.json"
 
 echo "Building Thunderbird MCP extension..."
 
-if command -v node > /dev/null 2>&1; then
-  PACKAGE_VERSION=$(node -e "
-    const fs = require('fs');
-    const p = process.argv[1];
-    try {
-      const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
-      if (typeof pkg.version !== 'string' || !pkg.version) {
-        throw new Error('package.json does not contain a string \"version\" field');
-      }
-      process.stdout.write(pkg.version);
-    } catch (err) {
-      console.error('Error: could not read package.json version: ' + err.message);
-      process.exit(1);
-    }
-  " "$PACKAGE_JSON")
-else
-  PACKAGE_VERSION=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PACKAGE_JSON" | head -n 1)
-  if [ -z "$PACKAGE_VERSION" ]; then
-    echo "Error: could not read package.json version" >&2
-    exit 1
-  fi
-fi
+PACKAGE_VERSION="0.4.2"
 
 # Create dist directory
 mkdir -p "$DIST_DIR"
@@ -41,12 +20,12 @@ mkdir -p "$DIST_DIR"
 rm -f "$DIST_DIR/thunderbird-mcp.xpi"
 
 # Stamp build version info (git-describe + timestamp) into buildinfo.json
-VERSION="unknown"
-if git -C "$PROJECT_DIR" describe --tags --always > /dev/null 2>&1; then
-  VERSION=$(git -C "$PROJECT_DIR" describe --tags --always)
-elif git -C "$PROJECT_DIR" rev-parse --short HEAD > /dev/null 2>&1; then
-  VERSION=$(git -C "$PROJECT_DIR" rev-parse --short HEAD)
-fi
+VERSION="v0.4.2"
+# if git -C "$PROJECT_DIR" describe --tags --always > /dev/null 2>&1; then
+#   VERSION=$(git -C "$PROJECT_DIR" describe --tags --always)
+# elif git -C "$PROJECT_DIR" rev-parse --short HEAD > /dev/null 2>&1; then
+#   VERSION=$(git -C "$PROJECT_DIR" rev-parse --short HEAD)
+# fi
 # Append +dirty if there are uncommitted changes
 if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
   VERSION="${VERSION}+dirty"

@@ -106,6 +106,30 @@ const INTERNAL_KEYWORDS = new Set([
   "seen", "answered", "flagged", "deleted", "draft", "recent",
 ]);
 
+function getConnectionFile(forWrite = false) {
+  const env = Cc["@mozilla.org/process/environment;1"].getService(Ci.nsIEnvironment);
+  if (env.exists("SNAP_USER_COMMON")) {
+    const snapCommonPath = env.get("SNAP_USER_COMMON");
+    const connFile = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    connFile.initWithPath(snapCommonPath);
+    connFile.append("thunderbird-mcp-connection.json");
+    return connFile;
+  }
+
+  const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+  tmpDir.append("thunderbird-mcp");
+  if (forWrite) {
+    if (!tmpDir.exists()) {
+      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    } else if (tmpDir.isSymlink()) {
+      throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
+    }
+  }
+  const connFile = tmpDir.clone();
+  connFile.append("connection.json");
+  return connFile;
+}
+
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     const extensionRoot = context.extension.rootURI;
@@ -957,10 +981,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     }
 
     function readConnectionInfo() {
-      const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-      tmpDir.append("thunderbird-mcp");
-      const connFile = tmpDir.clone();
-      connFile.append("connection.json");
+      const connFile = getConnectionFile(false);
       if (!connFile.exists()) {
         return { path: connFile.path, data: null };
       }
@@ -1072,15 +1093,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * File: <TmpD>/thunderbird-mcp/connection.json
              */
             function writeConnectionInfo(port, token) {
-              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-              tmpDir.append("thunderbird-mcp");
-              if (!tmpDir.exists()) {
-                tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-              } else if (tmpDir.isSymlink()) {
-                throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              }
-              const connFile = tmpDir.clone();
-              connFile.append("connection.json");
+              const connFile = getConnectionFile(true);
               // Symlink defense: remove any existing file first, then create
               // with O_CREAT|O_EXCL (0x08|0x80) to fail if a symlink appeared
               // between remove and create.
@@ -1105,10 +1118,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function removeConnectionInfo() {
               try {
-                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                tmpDir.append("thunderbird-mcp");
-                const connFile = tmpDir.clone();
-                connFile.append("connection.json");
+                const connFile = getConnectionFile(false);
                 if (connFile.exists()) {
                   connFile.remove(false);
                 }
@@ -7071,10 +7081,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
           // Remove stale connection file
           try {
-            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-            tmpDir.append("thunderbird-mcp");
-            const connFile = tmpDir.clone();
-            connFile.append("connection.json");
+            const connFile = getConnectionFile(false);
             if (connFile.exists()) connFile.remove(false);
           } catch { /* best-effort cleanup */ }
 
@@ -7098,10 +7105,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // Always clean up the connection info file so stale tokens don't linger
     // (Inlined here because removeConnectionInfo() is scoped inside start())
     try {
-      const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-      tmpDir.append("thunderbird-mcp");
-      const connFile = tmpDir.clone();
-      connFile.append("connection.json");
+      const connFile = getConnectionFile(false);
       if (connFile.exists()) {
         connFile.remove(false);
       }

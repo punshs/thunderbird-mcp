@@ -271,6 +271,21 @@ function findSnapConnectionCandidates(context) {
   const candidates = [];
   const seenPaths = new Set();
 
+  // Direct check for the shared snap common directory (fixes sandboxed /tmp access issues)
+  const snapCommonPath = pathImpl.join(snapDir, 'common', 'thunderbird-mcp-connection.json');
+  try {
+    const stat = fsImpl.statSync(snapCommonPath);
+    if (stat.isFile()) {
+      addUniqueCandidate(
+        candidates,
+        seenPaths,
+        makeCandidate('Snap common directory connection file', snapCommonPath, stat.mtimeMs)
+      );
+    }
+  } catch {
+    // Ignore missing file or permission error, proceed to proc scan
+  }
+
   try {
     const procDirs = fsImpl.readdirSync(procRoot).filter((entry) => /^\d+$/.test(entry));
     for (const pid of procDirs) {

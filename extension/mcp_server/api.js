@@ -232,6 +232,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getThread",
+        group: "messages", crud: "read",
+        title: "Get Thread",
+        description: "Get all messages in a conversation thread across all folders",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID of any message in the thread" },
+            folderPath: { type: "string", description: "The folder URI where this message is located" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
@@ -2638,7 +2652,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             read: msgHdr.isRead,
                             flagged: msgHdr.isFlagged,
                             tags: msgTags,
-                            _dateTs: msgDateTs
+                            _dateTs: msgDateTs,
+                            references: msgHdr.getStringProperty("references") || ""
                           };
                           if (preview) result.preview = preview;
                           results.push(result);
@@ -2781,7 +2796,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
                       tags: msgTags,
-                      _dateTs: msgDateTs
+                      _dateTs: msgDateTs,
+                      references: msgHdr.getStringProperty("references") || ""
                     };
                     if (preview) result.preview = preview;
                     results.push(result);
@@ -2817,6 +2833,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
               return paginate(results, offset, effectiveLimit);
+            }
+
+            async function getThread(messageId, folderPath) {
+              const found = findMessage(messageId, folderPath);
+              if (found.error) return found;
+
+              const baseMsg = found.msgHdr;
+              const subject = (baseMsg.mime2DecodedSubject || baseMsg.subject || "");
+
+              // Extract the base subject without Re:/Fwd:
+              let cleanSubject = subject.replace(/^(re|fwd|fw|aw):\s*/ig, "").trim();
+              if (!cleanSubject) cleanSubject = subject;
+
+              // Search all folders for this subject
+              const results = await searchMessages(cleanSubject, null, null, null, 200, 0, "asc", false, false, null, true, false, false);
+              if (results.error) return results;
+
+              // If paginated format
+              const messages = results.messages ? results.messages : results;
+
+              const baseMessageId = (baseMsg.messageId || "").toLowerCase();
+              const baseRefsStr = (baseMsg.getStringProperty("references") || "").toLowerCase() + " <" + baseMessageId + ">";
+              const inReplyTo = (baseMsg.getStringProperty("in-reply-to") || "").toLowerCase();
+
+              const baseRefs = new Set((baseRefsStr + " " + inReplyTo).match(/<[^>]+>/g) || []);
+
+              // Filter results to those that actually belong to the thread
+              // A message belongs to the thread if it shares references OR its messageId is in the base references
+              const threadMessages = messages.filter(msg => {
+                const msgId = (msg.id || "").toLowerCase();
+                const msgIdTag = "<" + msgId + ">";
+                if (msgId === baseMessageId || baseRefs.has(msgIdTag)) return true;
+
+                // Extract references from this message
+                const msgRefsStr = (msg.references || "").toLowerCase() + " " + msgIdTag;
+                const msgRefs = (msgRefsStr.match(/<[^>]+>/g) || []);
+
+                // If there's any intersection in the references/messageIds, it's the same thread
+                for (const ref of msgRefs) {
+                  if (baseRefs.has(ref)) return true;
+                }
+
+                // Strict match otherwise it might just be the same subject
+                return false;
+              });
+
+              // Clean up properties
+              threadMessages.forEach(msg => delete msg.references);
+
+              return threadMessages;
             }
 
             function searchContacts(query, maxResults) {
@@ -6446,6 +6512,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
+                case "getThread":
+                  return await getThread(args.messageId, args.folderPath);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "getMessages":

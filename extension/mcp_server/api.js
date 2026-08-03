@@ -133,6 +133,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getThread",
+        group: "messages", crud: "read",
+        title: "Get Thread",
+        description: "List every message in the conversation containing a given message, oldest first. Returns headers only -- use getMessage on individual ids to read bodies. Threading matches what Thunderbird's UI shows, which is folder-local: replies filed in Sent or Archive are not included.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Message ID of any message in the thread (from searchMessages results). Either this or threadId is required." },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            threadId: { type: "number", description: "Thread ID from a searchMessages result, as an alternative to messageId. Folder-local -- only meaningful together with the folderPath it came from." },
+            includePreview: { type: "boolean", description: "If true, include the ~200 char body preview for each message (default: true)" },
+            maxMessages: { type: "number", description: "Maximum messages to return (default 100, max 500). Truncation drops the oldest, keeping the most recent activity." },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
@@ -3291,6 +3308,123 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            /**
+             * List the messages Thunderbird considers part of one conversation.
+             *
+             * Uses the folder's thread database (nsIMsgThread) rather than
+             * walking References/In-Reply-To, so the result matches exactly what
+             * the Thunderbird UI groups together -- including replies whose
+             * headers are broken but which TB has stitched by subject. The
+             * tradeoff is that threads are folder-local: a reply sitting in Sent
+             * or Archive lives in a different msgDatabase and will not appear.
+             * Callers wanting cross-folder assembly should searchMessages on the
+             * subject instead.
+             *
+             * Returns headers only. Bodies are deliberately excluded -- a long
+             * thread would blow the response budget; use getMessage per id.
+             */
+            function getThread(messageId, folderPath, threadId, includePreview, maxMessages) {
+              try {
+                const opened = openFolder(folderPath);
+                if (opened.error) return opened;
+                const { folder, db } = opened;
+
+                if (!messageId && (threadId === undefined || threadId === null)) {
+                  return { error: "Either messageId or threadId is required" };
+                }
+
+                let seedHdr = null;
+                if (messageId) {
+                  const found = findMessage(messageId, folderPath);
+                  if (found.error) return found;
+                  seedHdr = found.msgHdr;
+                } else {
+                  const key = Number(threadId);
+                  if (!Number.isInteger(key) || key < 0) {
+                    return { error: `Invalid threadId: ${threadId}` };
+                  }
+                  try {
+                    seedHdr = db.getMsgHdrForKey(key);
+                  } catch {
+                    seedHdr = null;
+                  }
+                  if (!seedHdr) {
+                    return { error: `Thread not found in ${folderPath}: ${threadId}` };
+                  }
+                }
+
+                let thread = null;
+                try {
+                  thread = db.getThreadContainingMsgHdr(seedHdr);
+                } catch (e) {
+                  return { error: `Could not read thread: ${e}` };
+                }
+                if (!thread) {
+                  return { error: "Could not read thread: message is not in the folder's thread database" };
+                }
+
+                const wantPreview = includePreview !== false; // default true
+                const requested = Number(maxMessages);
+                const limit = Number.isFinite(requested) && requested > 0
+                  ? Math.min(Math.trunc(requested), 500)
+                  : 100;
+
+                const messages = [];
+                const childCount = thread.numChildren;
+                for (let i = 0; i < childCount; i++) {
+                  let hdr = null;
+                  try {
+                    hdr = thread.getChildHdrAt(i);
+                  } catch {
+                    continue; // child key present in the thread but header gone
+                  }
+                  if (!hdr) continue;
+
+                  const entry = {
+                    id: hdr.messageId,
+                    threadId: hdr.threadId,
+                    subject: hdr.mime2DecodedSubject || hdr.subject,
+                    author: hdr.mime2DecodedAuthor || hdr.author,
+                    recipients: hdr.mime2DecodedRecipients || hdr.recipients,
+                    ccList: hdr.ccList,
+                    date: hdr.date ? new Date(hdr.date / 1000).toISOString() : null,
+                    folder: folder.prettyName,
+                    folderPath: folder.URI,
+                    read: hdr.isRead,
+                    flagged: hdr.isFlagged,
+                    tags: getUserTags(hdr),
+                    isThreadRoot: hdr.messageKey === thread.threadKey,
+                    _dateTs: hdr.date || 0,
+                  };
+                  if (wantPreview) {
+                    const preview = hdr.getStringProperty("preview") || "";
+                    if (preview) entry.preview = preview;
+                  }
+                  messages.push(entry);
+                }
+
+                messages.sort((a, b) => a._dateTs - b._dateTs);
+
+                const totalMessages = messages.length;
+                // Truncate from the front: recent activity is what callers act on.
+                const kept = totalMessages > limit ? messages.slice(totalMessages - limit) : messages;
+                for (const m of kept) delete m._dateTs;
+
+                const rootEntry = kept.find(m => m.isThreadRoot);
+                return {
+                  subject: rootEntry ? rootEntry.subject : (kept[0] ? kept[0].subject : ""),
+                  threadId: seedHdr.threadId,
+                  folderPath: folder.URI,
+                  totalMessages,
+                  unreadCount: kept.filter(m => !m.read).length,
+                  truncated: totalMessages > kept.length,
+                  messages: kept,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
 	                try {
@@ -5271,6 +5405,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
+                case "getThread":
+                  return getThread(args.messageId, args.folderPath, args.threadId, args.includePreview, args.maxMessages);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":

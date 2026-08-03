@@ -144,7 +144,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             threadId: { type: "number", description: "Thread ID from a searchMessages result, as an alternative to messageId. Folder-local -- only meaningful together with the folderPath it came from." },
             includePreview: { type: "boolean", description: "If true, include the ~200 char body preview for each message (default: true)" },
-            maxMessages: { type: "number", description: "Maximum messages to return (default 100, max 500). Truncation drops the oldest, keeping the most recent activity." },
+            maxMessages: { type: "number", description: "Maximum messages to return (default 100, max 200). Truncation drops the oldest, keeping the most recent activity; totalMessages and unreadCount still describe the whole thread." },
           },
           required: ["folderPath"],
         },
@@ -3325,13 +3325,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function getThread(messageId, folderPath, threadId, includePreview, maxMessages) {
               try {
-                const opened = openFolder(folderPath);
-                if (opened.error) return opened;
-                const { folder, db } = opened;
-
                 if (!messageId && (threadId === undefined || threadId === null)) {
                   return { error: "Either messageId or threadId is required" };
                 }
+
+                const opened = openFolder(folderPath);
+                if (opened.error) return opened;
+                const { folder, db } = opened;
 
                 let seedHdr = null;
                 if (messageId) {
@@ -3343,10 +3343,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!Number.isInteger(key) || key < 0) {
                     return { error: `Invalid threadId: ${threadId}` };
                   }
+                  // threadId is the root message's key, so the fast path is a
+                  // direct key lookup. It throws once the root itself has been
+                  // deleted or moved away while replies stayed behind -- a
+                  // threadId searchMessages will still happily hand out -- so
+                  // fall back to finding any surviving member of the thread.
                   try {
                     seedHdr = db.getMsgHdrForKey(key);
                   } catch {
                     seedHdr = null;
+                  }
+                  if (!seedHdr) {
+                    for (const hdr of db.enumerateMessages()) {
+                      if (hdr.threadId === key) {
+                        seedHdr = hdr;
+                        break;
+                      }
+                    }
                   }
                   if (!seedHdr) {
                     return { error: `Thread not found in ${folderPath}: ${threadId}` };
@@ -3366,7 +3379,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const wantPreview = includePreview !== false; // default true
                 const requested = Number(maxMessages);
                 const limit = Number.isFinite(requested) && requested > 0
-                  ? Math.min(Math.trunc(requested), 500)
+                  ? Math.min(Math.trunc(requested), MAX_SEARCH_RESULTS_CAP)
                   : 100;
 
                 const messages = [];
@@ -3388,7 +3401,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     recipients: hdr.mime2DecodedRecipients || hdr.recipients,
                     ccList: hdr.ccList,
                     date: hdr.date ? new Date(hdr.date / 1000).toISOString() : null,
-                    folder: folder.prettyName,
+                    // prettyName was dropped from nsIMsgFolder in TB 141; the
+                    // rest of this file still reads it bare, but there is no
+                    // reason for a new tool to return undefined on modern
+                    // builds.
+                    folder: folder.localizedName || folder.name || folder.prettyName,
                     folderPath: folder.URI,
                     read: hdr.isRead,
                     flagged: hdr.isFlagged,
@@ -3405,18 +3422,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 messages.sort((a, b) => a._dateTs - b._dateTs);
 
+                // Counts describe the whole thread, not the returned window --
+                // otherwise "is this thread mostly unread?" silently answers
+                // about the last N messages instead.
                 const totalMessages = messages.length;
+                const unreadCount = messages.filter(m => !m.read).length;
+                // Resolve the subject before truncating: dropping the oldest
+                // drops the thread root, and every survivor is a "Re:".
+                const rootEntry = messages.find(m => m.isThreadRoot);
+                const threadSubject = rootEntry
+                  ? rootEntry.subject
+                  : (messages[0] ? messages[0].subject : "");
+
                 // Truncate from the front: recent activity is what callers act on.
                 const kept = totalMessages > limit ? messages.slice(totalMessages - limit) : messages;
                 for (const m of kept) delete m._dateTs;
 
-                const rootEntry = kept.find(m => m.isThreadRoot);
                 return {
-                  subject: rootEntry ? rootEntry.subject : (kept[0] ? kept[0].subject : ""),
+                  subject: threadSubject,
                   threadId: seedHdr.threadId,
                   folderPath: folder.URI,
+                  // numChildren counts what Thunderbird's UI shows; totalMessages
+                  // excludes children whose headers could not be read, so a gap
+                  // between the two is visible rather than silent.
+                  threadSize: childCount,
                   totalMessages,
-                  unreadCount: kept.filter(m => !m.read).length,
+                  unreadCount,
                   truncated: totalMessages > kept.length,
                   messages: kept,
                 };

@@ -1514,7 +1514,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function insertReplyBodyIntoComposeWindow(composeWin, body, isHtml) {
               if (!composeWin || !body) return;
-              const fragment = formatBodyFragmentHtml(body, isHtml);
+              // Review-window path. Thunderbird generates the quoted original
+              // itself here, so we can only style what we insert -- the typed
+              // body -- but that is the part the recipient reads first.
+              const fragment = wrapOutlookBody(formatBodyFragmentHtml(body, isHtml));
               if (!fragment) return;
 
               const browser = typeof composeWin.getBrowser === "function" ? composeWin.getBrowser() : null;
@@ -2051,6 +2054,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return text;
               }
               return escapeHtml(body || "").replace(/\n/g, '<br>');
+            }
+
+            /**
+             * Outlook's default composition font since the Aptos rollout. The
+             * fallbacks matter: Aptos_EmbeddedFont and Aptos_MSFontService are
+             * what Outlook itself emits, and Calibri catches recipients on older
+             * builds, so a message renders the same in Outlook, Thunderbird, and
+             * webmail rather than dropping to a serif default.
+             */
+            const OUTLOOK_BODY_FONT = 'Aptos, Aptos_EmbeddedFont, Aptos_MSFontService, Calibri, sans-serif';
+            const OUTLOOK_BODY_SIZE = '12pt';
+            /** Outlook renders the quoted-header block one size down, in Calibri. */
+            const OUTLOOK_QUOTE_FONT = 'Calibri, sans-serif';
+            const OUTLOOK_QUOTE_SIZE = '11pt';
+
+            /**
+             * Wrap composed body HTML so it inherits Outlook's default font
+             * instead of the recipient client's. Returns a bare div, safe to
+             * nest inside <body> or to hand to execCommand("insertHTML").
+             */
+            function wrapOutlookBody(html) {
+              if (!html) return "";
+              return `<div style="font-family:${OUTLOOK_BODY_FONT}; font-size:${OUTLOOK_BODY_SIZE}; color:#000000">${html}</div>`;
+            }
+
+            /**
+             * Build the Outlook-style attribution block that separates a new
+             * message from the one it quotes -- horizontal rule, then bolded
+             * From/Sent/To/Subject lines, then the original body.
+             *
+             * `kind` selects the wording Outlook uses: replies say "Sent", the
+             * forward variant is otherwise identical, which is why both paths
+             * share this instead of the old ad-hoc "-------- Forwarded Message"
+             * separator.
+             */
+            function buildOutlookQuoteBlock(msgHdr, originalBody) {
+              const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+              const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+              const origRecip = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+              const origSubj = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+              const escapedBody = escapeHtml(originalBody || "").replace(/\n/g, '<br>');
+
+              return `<br><hr tabindex="-1" style="display:inline-block; width:98%">` +
+                `<div dir="ltr"><font face="${OUTLOOK_QUOTE_FONT}" style="font-size:${OUTLOOK_QUOTE_SIZE}" color="#000000">` +
+                `<b>From:</b> ${escapeHtml(author)}<br>` +
+                `<b>Sent:</b> ${dateStr}<br>` +
+                `<b>To:</b> ${escapeHtml(origRecip)}<br>` +
+                `<b>Subject:</b> ${escapeHtml(origSubj)}` +
+                `</font></div><br>` +
+                `<div style="font-family:${OUTLOOK_BODY_FONT}; font-size:${OUTLOOK_BODY_SIZE}; color:#000000">${escapedBody}</div>`;
             }
 
             /**
@@ -3919,9 +3972,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const formatted = formatBodyHtml(body, isHtml);
                 if (isHtml && formatted.includes('<html')) {
+                  // Caller supplied a complete document -- respect their styling.
                   composeFields.body = formatted;
                 } else {
-                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
+                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${wrapOutlookBody(formatted)}</body></html>`;
                 }
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
@@ -4044,18 +4098,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
 
-	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-	                        const origRecip = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-	                        const origSubj = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-	                        const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
-
-	                        const quoteBlock = `<br><hr tabindex="-1" style="display:inline-block; width:98%"><div dir="ltr"><font face="Calibri, sans-serif" style="font-size:11pt" color="#000000"><b>From:</b> ${escapeHtml(author)}<br><b>Sent:</b> ${dateStr}<br><b>To:</b> ${escapeHtml(origRecip)}<br><b>Subject:</b> ${escapeHtml(origSubj)}</font></div><br>${escapedBody}`;
+	                        const quoteBlock = buildOutlookQuoteBlock(msgHdr, originalBody);
 
 	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
 	                        // it still uses a hand-built quoted body and cannot place the
 	                        // identity signature according to reply preferences.
-	                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+	                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${wrapOutlookBody(formatBodyHtml(body, isHtml))}${quoteBlock}</body></html>`;
 
 	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
 	                          if (result.success) {
@@ -4146,22 +4194,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // Get original body
                       const originalBody = extractPlainTextBody(aMimeMsg);
 
-                      // Build forward header block
-                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-                      const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                      const fwdSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                      const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-                      const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
-
-                      const forwardBlock = `-------- Forwarded Message --------<br>` +
-                        `Subject: ${escapeHtml(fwdSubject)}<br>` +
-                        `Date: ${dateStr}<br>` +
-                        `From: ${escapeHtml(fwdAuthor)}<br>` +
-                        `To: ${escapeHtml(fwdRecipients)}<br><br>` +
-                        escapedBody;
+                      // Same Outlook attribution block replies use, so a
+                      // forwarded thread and a replied thread look identical in
+                      // the recipient's client.
+                      const forwardBlock = buildOutlookQuoteBlock(msgHdr, originalBody);
 
                       // Combine intro body + forward block
-                      const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+                      const introHtml = body ? wrapOutlookBody(formatBodyHtml(body, isHtml)) : "";
 
                       composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
 

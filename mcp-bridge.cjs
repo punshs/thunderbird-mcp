@@ -62,18 +62,29 @@ function negotiateProtocolVersion(requested) {
 }
 
 /**
- * Trace the stdio conversation to stderr when THUNDERBIRD_MCP_DEBUG is set.
- * Clients that capture server stderr into their own logs (Claude Desktop
- * does) then show exactly what crossed the pipe, which is otherwise
- * invisible from the client side.
+ * Trace the stdio conversation for debugging a stalled handshake.
+ *
+ * THUNDERBIRD_MCP_DEBUG_FILE appends to a file; THUNDERBIRD_MCP_DEBUG writes
+ * to stderr. The file form exists because not every client surfaces a
+ * server's stderr -- when a handshake stalls and the client's own log only
+ * records what it sent, an absent stderr trace is ambiguous: it cannot
+ * distinguish "the bridge never ran" from "the bridge ran and nobody
+ * captured it". A file on disk is unambiguous.
  */
 function traceStdio(direction, payload) {
-  if (!process.env.THUNDERBIRD_MCP_DEBUG) {
+  const file = process.env.THUNDERBIRD_MCP_DEBUG_FILE;
+  if (!file && !process.env.THUNDERBIRD_MCP_DEBUG) {
     return;
   }
   try {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    process.stderr.write(`[thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`);
+    const line = `${new Date().toISOString()} [thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`;
+    if (file) {
+      fs.appendFileSync(file, line);
+    }
+    if (process.env.THUNDERBIRD_MCP_DEBUG) {
+      process.stderr.write(line);
+    }
   } catch {
     // Tracing must never break the bridge.
   }
@@ -780,10 +791,27 @@ async function forwardToThunderbird(message, _retried) {
 }
 
 function startBridge() {
+  // Recorded before anything else so the trace distinguishes "never started"
+  // from "started and then went quiet", and identifies which runtime and
+  // which copy of this file the client actually launched.
+  traceStdio('boot   ', {
+    version: BRIDGE_VERSION,
+    node: process.version,
+    execPath: process.execPath,
+    script: __filename,
+    pid: process.pid,
+    connectionFileEnv: process.env.THUNDERBIRD_MCP_CONNECTION_FILE || null,
+  });
+
   // Ensure stdout doesn't buffer - critical for MCP protocol
   if (process.stdout._handle?.setBlocking) {
     process.stdout._handle.setBlocking(true);
   }
+
+  process.on('uncaughtException', (err) => {
+    traceStdio('FATAL  ', { message: err.message, stack: err.stack });
+    process.exit(1);
+  });
 
   let pendingRequests = 0;
   let stdinClosed = false;

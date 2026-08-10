@@ -226,9 +226,25 @@ function findSnapConnectionCandidates(context) {
     };
   }
 
-  try {
-    fsImpl.accessSync(snapDir, fs.constants.F_OK);
-  } catch {
+  // Detect a snap install from any of several signals, not just ~/snap. The
+  // Thunderbird snap points TMPDIR at ~/Downloads/thunderbird.tmp so the
+  // desktop portal can reach temp files, and that directory is by itself
+  // proof of a snap -- but the old ~/snap-only probe returned early before
+  // the Downloads fallback below was ever considered, so a layout the
+  // function already knew how to handle was reported as
+  // 'snap install not detected'.
+  const downloadsTmp = pathImpl.join(homeDir, 'Downloads', 'thunderbird.tmp');
+  const privateTmpDir = pathImpl.join(SNAP_PRIVATE_TMP_ROOT, `snap.${DEFAULT_SNAP_INSTANCE}`);
+  const exists = (p) => {
+    try {
+      fsImpl.accessSync(p, fs.constants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!exists(snapDir) && !exists(downloadsTmp) && !exists(privateTmpDir)) {
     return {
       notes: [makeAttempt('Snap detection', pattern, 'snap install not detected')],
       candidates: [],

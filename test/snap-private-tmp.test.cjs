@@ -155,3 +155,39 @@ describe("Snap private /tmp translation", () => {
     assert.ok(JSON.stringify(result.notes).includes("snap install not detected"));
   });
 });
+
+describe("Snap detection signals", () => {
+  const DOWNLOADS_TMP = path.join(HOME, "Downloads", "thunderbird.tmp");
+  const DOWNLOADS_CONN = path.join(DOWNLOADS_TMP, "thunderbird-mcp", "connection.json");
+
+  // The Thunderbird snap points TMPDIR at ~/Downloads/thunderbird.tmp. The
+  // Downloads fallback has always known that path, but a ~/snap-only probe
+  // returned early and never reached it.
+  it("detects a snap from ~/Downloads/thunderbird.tmp when ~/snap is absent", () => {
+    const fsImpl = makeFs({
+      dirs: [DOWNLOADS_TMP],
+      files: { [DOWNLOADS_CONN]: 9000 },
+      procEntries: [],
+    });
+    const paths = run(fsImpl).candidates.map(c => c.path);
+    assert.ok(
+      paths.includes(DOWNLOADS_CONN),
+      `Downloads fallback must be reachable without ~/snap, got:\n${paths.join("\n")}`
+    );
+  });
+
+  it("detects a snap from the private tmp root when ~/snap is absent", () => {
+    const fsImpl = makeFs({
+      dirs: ["/tmp/snap-private-tmp/snap.thunderbird"],
+      files: { [HOST_PATH]: 9000 },
+      procEntries: [],
+    });
+    const paths = run(fsImpl).candidates.map(c => c.path);
+    assert.ok(paths.includes(HOST_PATH), "private tmp root should be enough to proceed");
+  });
+
+  it("still reports not detected when no signal is present at all", () => {
+    const result = run(makeFs({ dirs: [], files: {}, procEntries: [] }));
+    assert.equal(result.candidates.length, 0);
+  });
+});

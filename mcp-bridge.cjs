@@ -23,6 +23,16 @@ const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 
+// snap-confine gives each snap a private /tmp inside its mount namespace. The
+// snap sees TMPDIR=/tmp, but that is NOT the host's /tmp -- from outside the
+// namespace the same directory is reachable at
+// /tmp/snap-private-tmp/snap.<instance>/tmp. Reading TMPDIR out of
+// /proc/<pid>/environ therefore yields a path that resolves to the wrong
+// directory for anything running on the host, which is exactly where the
+// bridge runs.
+const SNAP_PRIVATE_TMP_ROOT = '/tmp/snap-private-tmp';
+const DEFAULT_SNAP_INSTANCE = 'thunderbird';
+
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
 let lastDiscoveryAttempts = [];
@@ -261,6 +271,37 @@ function findSnapConnectionCandidates(context) {
           seenPaths,
           makeCandidate(`Snap TMPDIR from /proc/${pid}/environ`, candidatePath, mtimeMs)
         );
+
+        // The TMPDIR above is namespace-relative. Translate it to the host
+        // path so the bridge can actually read the file. SNAP_INSTANCE_NAME
+        // distinguishes parallel installs (thunderbird_beta and friends);
+        // fall back to the plain name when it is absent.
+        const instanceEntry = environ
+          .split('\0')
+          .find((entry) => entry.startsWith('SNAP_INSTANCE_NAME=') || entry.startsWith('SNAP_NAME='));
+        const instance = instanceEntry
+          ? instanceEntry.slice(instanceEntry.indexOf('=') + 1)
+          : DEFAULT_SNAP_INSTANCE;
+        if (instance) {
+          const hostPath = pathImpl.join(
+            SNAP_PRIVATE_TMP_ROOT,
+            `snap.${instance}`,
+            tmpDir,
+            THUNDERBIRD_MCP_SUBDIR,
+            CONNECTION_FILE_BASENAME
+          );
+          let hostMtime = Number.NEGATIVE_INFINITY;
+          try {
+            hostMtime = fsImpl.statSync(hostPath).mtimeMs;
+          } catch {
+            // Missing file is handled later when the candidate is read.
+          }
+          addUniqueCandidate(
+            candidates,
+            seenPaths,
+            makeCandidate(`Snap private tmp for snap.${instance}`, hostPath, hostMtime)
+          );
+        }
       } catch {
         // Processes can disappear or deny access while we scan /proc.
       }
@@ -271,6 +312,28 @@ function findSnapConnectionCandidates(context) {
       candidates: [],
     };
   }
+
+  // Static form of the private-tmp path, for when /proc gave us nothing --
+  // Thunderbird not running yet, or environ unreadable. snap-confine's layout
+  // is fixed, so this is a safe guess even without the process.
+  const privateTmpFallback = pathImpl.join(
+    SNAP_PRIVATE_TMP_ROOT,
+    `snap.${DEFAULT_SNAP_INSTANCE}`,
+    'tmp',
+    THUNDERBIRD_MCP_SUBDIR,
+    CONNECTION_FILE_BASENAME
+  );
+  let privateTmpMtime = Number.NEGATIVE_INFINITY;
+  try {
+    privateTmpMtime = fsImpl.statSync(privateTmpFallback).mtimeMs;
+  } catch {
+    // Missing file is handled later when the candidate is read.
+  }
+  addUniqueCandidate(
+    candidates,
+    seenPaths,
+    makeCandidate('Snap private tmp fallback', privateTmpFallback, privateTmpMtime)
+  );
 
   // Match the official snap tmpdir helper as a best-effort fallback when /proc
   // cannot tell us the runtime TMPDIR.

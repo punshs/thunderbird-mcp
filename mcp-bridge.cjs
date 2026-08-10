@@ -23,6 +23,52 @@ const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 
+const BRIDGE_VERSION = '0.6.1';
+
+/**
+ * MCP revisions this bridge can speak, newest first.
+ *
+ * The bridge only exposes tools and answers lifecycle methods, and that
+ * surface is identical across these revisions, so any of them is safe to
+ * agree to.
+ */
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+const FALLBACK_PROTOCOL_VERSION = '2024-11-05';
+
+/**
+ * Pick the protocol version to report from initialize.
+ *
+ * The spec requires the server to echo the client's requested version when it
+ * supports it, and only substitute its own when it does not. This previously
+ * returned a hardcoded 2024-11-05 no matter what was asked for; a client that
+ * requires the version it proposed sees that as a failed handshake and waits
+ * until it times out, while the server looks perfectly healthy from outside.
+ */
+function negotiateProtocolVersion(requested) {
+  if (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) {
+    return requested;
+  }
+  return FALLBACK_PROTOCOL_VERSION;
+}
+
+/**
+ * Trace the stdio conversation to stderr when THUNDERBIRD_MCP_DEBUG is set.
+ * Clients that capture server stderr into their own logs (Claude Desktop
+ * does) then show exactly what crossed the pipe, which is otherwise
+ * invisible from the client side.
+ */
+function traceStdio(direction, payload) {
+  if (!process.env.THUNDERBIRD_MCP_DEBUG) {
+    return;
+  }
+  try {
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    process.stderr.write(`[thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`);
+  } catch {
+    // Tracing must never break the bridge.
+  }
+}
+
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
 let lastDiscoveryAttempts = [];
@@ -528,9 +574,9 @@ async function handleMessage(line) {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: negotiateProtocolVersion(message.params?.protocolVersion),
           capabilities: { tools: {} },
-          serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
+          serverInfo: { name: 'thunderbird-mcp', version: BRIDGE_VERSION }
         }
       };
     case 'ping':
@@ -694,19 +740,26 @@ function startBridge() {
       // Leave as null when request cannot be parsed
     }
 
+    traceStdio('<-- in ', line);
+
     pendingRequests++;
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
+          traceStdio('--> out', response);
           await writeOutput(JSON.stringify(response) + '\n');
+        } else {
+          traceStdio('--- notification, no reply', line);
         }
       })
       .catch(async (err) => {
-        await writeOutput(JSON.stringify({
+        const failure = {
           jsonrpc: '2.0',
           id: messageId,
           error: { code: -32700, message: `Bridge error: ${err.message}` }
-        }) + '\n');
+        };
+        traceStdio('--> err', failure);
+        await writeOutput(JSON.stringify(failure) + '\n');
       })
       .finally(() => {
         pendingRequests--;

@@ -33,7 +33,7 @@ const CONNECTION_FILE_BASENAME = 'connection.json';
 const SNAP_PRIVATE_TMP_ROOT = '/tmp/snap-private-tmp';
 const DEFAULT_SNAP_INSTANCE = 'thunderbird';
 
-const BRIDGE_VERSION = '0.6.1';
+const BRIDGE_VERSION = '0.6.3';
 
 /**
  * MCP revisions this bridge can speak, newest first.
@@ -72,21 +72,50 @@ function negotiateProtocolVersion(requested) {
  * captured it". A file on disk is unambiguous.
  */
 function traceStdio(direction, payload) {
-  const file = process.env.THUNDERBIRD_MCP_DEBUG_FILE;
-  if (!file && !process.env.THUNDERBIRD_MCP_DEBUG) {
+  const configured = process.env.THUNDERBIRD_MCP_DEBUG_FILE;
+  if (!configured && !process.env.THUNDERBIRD_MCP_DEBUG) {
     return;
   }
+
+  let line;
   try {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    const line = `${new Date().toISOString()} [thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`;
-    if (file) {
-      fs.appendFileSync(file, line);
-    }
-    if (process.env.THUNDERBIRD_MCP_DEBUG) {
-      process.stderr.write(line);
-    }
+    line = `${new Date().toISOString()} [thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`;
   } catch {
-    // Tracing must never break the bridge.
+    return; // Tracing must never break the bridge.
+  }
+
+  if (process.env.THUNDERBIRD_MCP_DEBUG) {
+    try {
+      process.stderr.write(line);
+    } catch { /* ignore */ }
+  }
+
+  if (!configured) {
+    return;
+  }
+
+  // A client that does not expand ${HOME} and friends hands the literal
+  // string through, and appending to it fails on a directory that cannot
+  // exist. Silently swallowing that is how a trace file goes missing and
+  // looks like "the bridge never ran" -- so fall back to a path that is
+  // always writable, and say so on stderr.
+  const targets = [configured];
+  if (/\$\{|^~|^(?!\/)/.test(configured)) {
+    targets.push(path.join(os.tmpdir(), 'thunderbird-mcp-trace.log'));
+  }
+
+  for (const target of targets) {
+    try {
+      fs.appendFileSync(target, line);
+      return;
+    } catch (err) {
+      try {
+        process.stderr.write(
+          `[thunderbird-mcp] could not write trace to ${target}: ${err.message}\n`
+        );
+      } catch { /* ignore */ }
+    }
   }
 }
 

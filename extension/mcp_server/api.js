@@ -3478,11 +3478,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     recipients: hdr.mime2DecodedRecipients || hdr.recipients,
                     ccList: hdr.ccList,
                     date: hdr.date ? new Date(hdr.date / 1000).toISOString() : null,
-                    // prettyName was dropped from nsIMsgFolder in TB 141; the
-                    // rest of this file still reads it bare, but there is no
-                    // reason for a new tool to return undefined on modern
-                    // builds.
-                    folder: folder.localizedName || folder.name || folder.prettyName,
+                    folder: folderDisplayName(folder),
                     folderPath: folder.URI,
                     read: hdr.isRead,
                     flagged: hdr.isFlagged,

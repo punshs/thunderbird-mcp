@@ -1033,6 +1033,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Folder name for display, across Thunderbird versions.
+             *
+             * nsIMsgFolder.prettyName was removed in Thunderbird 141 (bug
+             * 1977840) and replaced by localizedName. Reading it bare yields
+             * undefined on 141+, which silently turned every `folder` field in
+             * a tool response into null. localizedName is preferred where
+             * available because it translates the special folders (Inbox,
+             * Sent, Trash) into the app locale the way prettyName used to;
+             * `name` is the untranslated fallback, and prettyName is kept last
+             * so nothing regresses on Thunderbird 102-140.
+             */
+            function folderDisplayName(folder) {
+              if (!folder) return "";
+              return folder.localizedName || folder.name || folder.prettyName || "";
+            }
+
+            /**
              * Check if a resolved folder belongs to an allowed account.
              * Returns true if the folder's account is accessible, false otherwise.
              */
@@ -1135,7 +1152,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip virtual/search folders to avoid duplicates
                   if (folder.flags & 0x00000020) return;
 
-                  const prettyName = folder.prettyName;
+                  const prettyName = folderDisplayName(folder);
                   results.push({
                     name: prettyName || folder.name || "(unnamed)",
                     path: folder.URI,
@@ -2221,7 +2238,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return current;
                   }
                 } catch {}
-                if (!fallback && current?.prettyName && TRASH_NAMES.includes(current.prettyName.toLowerCase())) {
+                const currentName = folderDisplayName(current);
+                if (!fallback && currentName && TRASH_NAMES.includes(currentName.toLowerCase())) {
                   fallback = current;
                 }
                 try {
@@ -2346,7 +2364,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                             ccList: msgHdr.ccList,
                             date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                            folder: folder.prettyName,
+                            folder: folderDisplayName(folder),
                             folderPath: folder.URI,
                             read: msgHdr.isRead,
                             flagged: msgHdr.isFlagged,
@@ -2489,7 +2507,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                       ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      folder: folder.prettyName,
+                      folder: folderDisplayName(folder),
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
@@ -4374,7 +4392,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      folder: folder.prettyName,
+                      folder: folderDisplayName(folder),
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
@@ -4654,7 +4672,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   if (parent.hasSubFolders) {
                     for (const sub of parent.subFolders) {
-                      if (sub.prettyName === name || sub.name === name) {
+                      if (folderDisplayName(sub) === name || sub.name === name) {
                         newPath = sub.URI;
                         break;
                       }
@@ -4711,7 +4729,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const delResult = getAccessibleFolder(folderPath);
                 if (delResult.error) return delResult;
                 const folder = delResult.folder;
-                const folderName = folder.prettyName || folder.name || folderPath;
+                const folderName = folderDisplayName(folder) || folderPath;
 
                 const parent = folder.parent;
                 if (!parent) {
@@ -4879,12 +4897,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const srcResult = getAccessibleFolder(folderPath);
                 if (srcResult.error) return srcResult;
                 const folder = srcResult.folder;
-                const folderName = folder.prettyName || folder.name || folderPath;
+                const folderName = folderDisplayName(folder) || folderPath;
 
                 const destResult = getAccessibleFolder(newParentPath);
                 if (destResult.error) return destResult;
                 const newParent = destResult.folder;
-                const parentName = newParent.prettyName || newParent.name || newParentPath;
+                const parentName = folderDisplayName(newParent) || newParentPath;
 
                 if (folder.parent && folder.parent.URI === newParentPath) {
                   return { error: "Folder is already under this parent" };

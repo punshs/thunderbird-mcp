@@ -76,6 +76,26 @@ export function finalizeConversationScan(resolved, scanTruncated, warnings = [],
   };
 }
 
+export function summarizeRefreshResults(results) {
+  const counts = {
+    attempted: results.length,
+    refreshed: 0,
+    failed: 0,
+    timedOut: 0,
+    skipped: 0,
+  };
+  for (const result of results) {
+    if (result.status === "refreshed") counts.refreshed++;
+    else if (result.status === "failed") counts.failed++;
+    else if (result.status === "timed_out") counts.timedOut++;
+    else if (result.status === "skipped") counts.skipped++;
+  }
+  return {
+    success: counts.failed === 0 && counts.timedOut === 0,
+    counts,
+  };
+}
+
 function haveSameOutlookThread(record, member) {
   const topic = String(record.threadTopic || "").trim();
   if (!topic || topic !== String(member.threadTopic || "").trim()) return false;

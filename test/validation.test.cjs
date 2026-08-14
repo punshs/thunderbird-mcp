@@ -68,6 +68,19 @@ function createValidator(tools) {
 // Tool definitions matching the schemas in api.js for new tools
 const sampleTools = [
   {
+    name: "refreshFolders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        accountId: { type: "string" },
+        folderPath: { type: "string" },
+        recursive: { type: "boolean" },
+        timeoutMs: { type: "number" },
+      },
+      required: [],
+    },
+  },
+  {
     name: "getConversation",
     inputSchema: {
       type: "object",
@@ -202,6 +215,32 @@ const sampleTools = [
 ];
 
 const validate = createValidator(sampleTools);
+
+describe('Validation: refreshFolders', () => {
+  it('accepts an empty request or all optional refresh selectors', () => {
+    assert.deepStrictEqual(validate('refreshFolders', {}), []);
+    assert.deepStrictEqual(validate('refreshFolders', {
+      accountId: 'account1',
+      folderPath: 'imap://user@server/INBOX',
+      recursive: true,
+      timeoutMs: 5_000,
+    }), []);
+  });
+
+  for (const [parameter, value, expectedType] of [
+    ['accountId', 7, 'string'],
+    ['folderPath', false, 'string'],
+    ['recursive', 'true', 'boolean'],
+    ['timeoutMs', '5000', 'number'],
+  ]) {
+    it(`rejects a non-${expectedType} ${parameter}`, () => {
+      assert.deepStrictEqual(
+        validate('refreshFolders', { [parameter]: value }),
+        [`Parameter '${parameter}' must be ${expectedType}, got ${typeof value}`]
+      );
+    });
+  }
+});
 
 describe('Validation: getConversation', () => {
   it('accepts a seed, folder, and numeric maximum', () => {

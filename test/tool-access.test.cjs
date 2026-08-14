@@ -63,6 +63,7 @@ const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar:
 const ALL_TOOLS = [
   { name: "listAccounts", group: "system", crud: "read" },
   { name: "listFolders", group: "system", crud: "read" },
+  { name: "refreshFolders", group: "folders", crud: "update" },
   { name: "getAccountAccess", group: "system", crud: "read" },
   { name: "searchMessages", group: "messages", crud: "read" },
   { name: "getMessage", group: "messages", crud: "read" },

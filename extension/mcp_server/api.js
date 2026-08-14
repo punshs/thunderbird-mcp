@@ -68,6 +68,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       resProto.ALLOW_CONTENT_ACCESS
     );
 
+    const {
+      normalizeMessageId,
+      parseMessageIdList,
+      resolveConversationMembers,
+    } = ChromeUtils.importESModule(
+      "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
+    );
+
     const tools = [
       {
         name: "listAccounts",
@@ -147,6 +155,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             maxMessages: { type: "number", description: "Maximum messages to return (default 100, max 200). Truncation drops the oldest, keeping the most recent activity; totalMessages and unreadCount still describe the whole thread." },
           },
           required: ["folderPath"],
+        },
+      },
+      {
+        name: "getConversation",
+        group: "messages", crud: "read",
+        title: "Get Cross-Folder Conversation",
+        description: "List exact header-linked messages across folders in the seed account, including Sent Items replies. Unlike getThread, this follows Message-ID references across folders and never joins by subject alone.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Seed message ID" },
+            folderPath: { type: "string", description: "Folder URI containing the seed" },
+            maxMessages: { type: "number", description: "Maximum messages returned (default 100, max 200)" },
+          },
+          required: ["messageId", "folderPath"],
         },
       },
       {
@@ -3529,6 +3552,258 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function normalizedConversationTopic(value) {
+              let topic = String(value || "").trim();
+              let previous = "";
+              while (topic && topic !== previous) {
+                previous = topic;
+                topic = topic.replace(/^\s*(?:re|fw|fwd)\s*:\s*/i, "").trim();
+              }
+              return topic;
+            }
+
+            function conversationAuthorAddress(value) {
+              const author = String(value || "").trim();
+              if (!author) return "";
+
+              try {
+                const parsed = MailServices.headerParser.parseEncodedHeader(author);
+                if (parsed && parsed.length > 0 && parsed[0].email) {
+                  return String(parsed[0].email).trim().toLowerCase();
+                }
+              } catch {}
+
+              try {
+                const mailboxes = MailServices.headerParser.extractHeaderAddressMailboxes(author);
+                if (mailboxes) {
+                  return String(mailboxes).split(",", 1)[0].trim().toLowerCase();
+                }
+              } catch {}
+
+              const angleMatch = author.match(/<([^<>]+)>/);
+              return String(angleMatch ? angleMatch[1] : author).trim().toLowerCase();
+            }
+
+            function readConversationHeaderBlock(folder, msgHdr) {
+              let hasLocalStream = false;
+              try {
+                hasLocalStream = folder.hasMsgOffline(msgHdr.messageKey);
+              } catch {}
+              const folderURI = String(folder.URI || "");
+              const serverType = String(folder.server?.type || "").toLowerCase();
+              hasLocalStream = hasLocalStream || folderURI.startsWith("mailbox:") ||
+                ["none", "pop3", "movemail"].includes(serverType);
+              if (!hasLocalStream) return null;
+
+              const MAX_RAW_HEADER_BYTES = 256 * 1024;
+              const RAW_HEADER_CHUNK_BYTES = 8 * 1024;
+              let stream = null;
+              try {
+                stream = folder.getMsgInputStream(msgHdr, {});
+                let expectedSize = 0;
+                try {
+                  expectedSize = folder.hasMsgOffline(msgHdr.messageKey)
+                    ? msgHdr.offlineMessageSize
+                    : msgHdr.messageSize;
+                } catch {
+                  expectedSize = msgHdr.messageSize || 0;
+                }
+                let remaining = Math.min(
+                  expectedSize > 0 ? expectedSize : MAX_RAW_HEADER_BYTES,
+                  MAX_RAW_HEADER_BYTES
+                );
+                let raw = "";
+                while (remaining > 0) {
+                  let available = 0;
+                  try {
+                    available = stream.available();
+                  } catch {
+                    break;
+                  }
+                  if (available <= 0) break;
+                  const chunkSize = Math.min(available, remaining, RAW_HEADER_CHUNK_BYTES);
+                  raw += NetUtil.readInputStreamToString(stream, chunkSize);
+                  const boundary = raw.match(/\r\n\r\n|\n\n|\r\r/);
+                  if (boundary) return raw.slice(0, boundary.index);
+                  remaining -= chunkSize;
+                }
+                return null;
+              } catch {
+                return null;
+              } finally {
+                if (stream) try { stream.close(); } catch {}
+              }
+            }
+
+            function parseConversationHeaders(headerBlock) {
+              const headers = Object.create(null);
+              const unfolded = String(headerBlock || "").replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
+              for (const line of unfolded.split(/\r\n|\r|\n/)) {
+                const colon = line.indexOf(":");
+                if (colon <= 0) continue;
+                const name = line.slice(0, colon).trim().toLowerCase();
+                if (!["in-reply-to", "references", "thread-topic", "thread-index"].includes(name)) continue;
+                if (!headers[name]) headers[name] = line.slice(colon + 1).trim();
+              }
+              return headers;
+            }
+
+            function collectConversationRecords(seedHdr, seedFolder) {
+              let account = null;
+              try {
+                account = MailServices.accounts.findAccountForServer(seedFolder.server);
+              } catch {}
+              if (!account) return { error: "Could not resolve the seed account" };
+              if (!getAccessibleAccounts().some(accessible => accessible.key === account.key)) {
+                return { error: `Account not accessible: ${account.key}` };
+              }
+
+              const identityAddresses = new Set();
+              for (const identity of account.identities) {
+                const address = String(identity.email || "").trim().toLowerCase();
+                if (address) identityAddresses.add(address);
+              }
+
+              const records = [];
+              const rawCandidates = [];
+              const warningSet = new Set();
+              const root = account.incomingServer?.rootFolder;
+              if (!root) return { error: `Account has no root folder: ${account.key}` };
+              const virtualFlag = Ci.nsMsgFolderFlags.Virtual;
+              const seedTopic = normalizedConversationTopic(
+                seedHdr.getStringProperty("thread-topic") ||
+                seedHdr.mime2DecodedSubject ||
+                seedHdr.subject
+              );
+              let enumeratedHeaders = 0;
+
+              function walk(folder) {
+                if (!folder || enumeratedHeaders >= SEARCH_COLLECTION_CAP) return;
+
+                let selectable = false;
+                try {
+                  selectable = !folder.isServer && !(folder.flags & virtualFlag) && !folder.noSelect;
+                } catch {}
+
+                if (selectable) {
+                  try {
+                    const db = folder.msgDatabase;
+                    if (db) {
+                      for (const msgHdr of db.enumerateMessages()) {
+                        if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) break;
+                        enumeratedHeaders++;
+
+                        const id = normalizeMessageId(msgHdr.messageId);
+                        if (!id) continue;
+                        const references = [];
+                        try {
+                          for (let i = 0; i < msgHdr.numReferences; i++) {
+                            references.push(msgHdr.getStringReference(i));
+                          }
+                        } catch {}
+                        const inReplyTo = msgHdr.getStringProperty("in-reply-to") || "";
+                        const threadTopic = msgHdr.getStringProperty("thread-topic") || "";
+                        const threadIndex = msgHdr.getStringProperty("thread-index") || "";
+                        const subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                        const record = {
+                          id,
+                          inReplyTo,
+                          references: parseMessageIdList(references),
+                          threadTopic,
+                          threadIndex,
+                          subject,
+                          author,
+                          recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
+                          ccList: msgHdr.ccList || "",
+                          date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                          folder: folderDisplayName(folder),
+                          folderPath: folder.URI,
+                          read: msgHdr.isRead,
+                          flagged: msgHdr.isFlagged,
+                          tags: getUserTags(msgHdr),
+                          direction: identityAddresses.has(conversationAuthorAddress(author))
+                            ? "outgoing"
+                            : "incoming",
+                          _dateTs: msgHdr.date || 0,
+                        };
+                        records.push(record);
+
+                        const candidateTopic = normalizedConversationTopic(threadTopic || subject);
+                        if (candidateTopic === seedTopic && (!threadTopic || !threadIndex)) {
+                          rawCandidates.push({ record, folder, msgHdr });
+                        }
+                      }
+                    }
+                  } catch {
+                    // Skip inaccessible folder databases.
+                  }
+                }
+
+                try {
+                  if (folder.hasSubFolders) {
+                    for (const subfolder of folder.subFolders) {
+                      if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) break;
+                      walk(subfolder);
+                    }
+                  }
+                } catch {}
+              }
+
+              walk(root);
+
+              for (const { record, folder, msgHdr } of rawCandidates) {
+                const headerBlock = readConversationHeaderBlock(folder, msgHdr);
+                if (!headerBlock) {
+                  warningSet.add(`Raw headers unavailable for ${folder.URI}`);
+                  continue;
+                }
+                const rawHeaders = parseConversationHeaders(headerBlock);
+                if (!record.inReplyTo && rawHeaders["in-reply-to"]) {
+                  record.inReplyTo = rawHeaders["in-reply-to"];
+                }
+                if (record.references.length === 0 && rawHeaders.references) {
+                  record.references = parseMessageIdList(rawHeaders.references);
+                }
+                if (!record.threadTopic && rawHeaders["thread-topic"]) {
+                  record.threadTopic = rawHeaders["thread-topic"];
+                }
+                if (!record.threadIndex && rawHeaders["thread-index"]) {
+                  record.threadIndex = rawHeaders["thread-index"];
+                }
+              }
+
+              return { account, records, warnings: [...warningSet] };
+            }
+
+            async function getConversation(messageId, folderPath, maxMessages) {
+              try {
+                const seedMessageId = normalizeMessageId(messageId);
+                const found = findMessage(seedMessageId, folderPath);
+                if (found.error) return found;
+
+                const collected = collectConversationRecords(found.msgHdr, found.folder);
+                if (collected.error) return collected;
+                const { account, records, warnings } = collected;
+                const resolved = resolveConversationMembers(records, seedMessageId, maxMessages);
+                if (resolved.error) return resolved;
+
+                const messages = resolved.members.sort((a, b) => a._dateTs - b._dateTs);
+                for (const message of messages) delete message._dateTs;
+
+                return {
+                  seedMessageId,
+                  accountId: account.key,
+                  totalMessages: resolved.totalMessages,
+                  truncated: resolved.truncated,
+                  warnings,
+                  messages,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
 	                try {
@@ -5495,6 +5770,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "getThread":
                   return getThread(args.messageId, args.folderPath, args.threadId, args.includePreview, args.maxMessages);
+                case "getConversation":
+                  return await getConversation(args.messageId, args.folderPath, args.maxMessages);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":

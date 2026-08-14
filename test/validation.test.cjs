@@ -68,6 +68,18 @@ function createValidator(tools) {
 // Tool definitions matching the schemas in api.js for new tools
 const sampleTools = [
   {
+    name: "getConversation",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+        maxMessages: { type: "number" },
+      },
+      required: ["messageId", "folderPath"],
+    },
+  },
+  {
     name: "searchMessages",
     inputSchema: {
       type: "object",
@@ -190,6 +202,33 @@ const sampleTools = [
 ];
 
 const validate = createValidator(sampleTools);
+
+describe('Validation: getConversation', () => {
+  it('accepts a seed, folder, and numeric maximum', () => {
+    const errors = validate('getConversation', {
+      messageId: 'seed@example.test',
+      folderPath: 'imap://user@server/INBOX',
+      maxMessages: 25,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('requires messageId', () => {
+    const errors = validate('getConversation', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, ['Missing required parameter: messageId']);
+  });
+
+  it('rejects a string maxMessages', () => {
+    const errors = validate('getConversation', {
+      messageId: 'seed@example.test',
+      folderPath: 'imap://user@server/INBOX',
+      maxMessages: '25',
+    });
+    assert.deepStrictEqual(errors, ["Parameter 'maxMessages' must be number, got string"]);
+  });
+});
 
 describe('Validation: updateMessage with tags', () => {
   it('accepts addTags as array', () => {

@@ -1,6 +1,7 @@
 "use strict";
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
@@ -11,6 +12,13 @@ const moduleUrl = pathToFileURL(path.join(
   "mcp_server",
   "message_workflows.sys.mjs"
 )).href;
+const apiSource = fs.readFileSync(path.join(
+  __dirname,
+  "..",
+  "extension",
+  "mcp_server",
+  "api.js"
+), "utf8");
 
 describe("conversation matching", () => {
   const outlookThreadIndex = (rootByte, childByte) => Buffer.concat([
@@ -75,5 +83,9 @@ describe("conversation matching", () => {
     ], "seed@test", 100);
     assert.deepStrictEqual(outlookMatch.members.map(m => m.id), ["seed@test", "sent@test"]);
     assert.equal(outlookMatch.members[1].matchReason, "outlook-thread");
+  });
+
+  it("dispatches getConversation through the async adapter", () => {
+    assert.match(apiSource, /case "getConversation":\s*return await getConversation\(/);
   });
 });

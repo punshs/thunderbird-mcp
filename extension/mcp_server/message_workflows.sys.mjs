@@ -11,8 +11,11 @@ export function insertReplyHtmlAtTop(editorDoc, fragmentHtml) {
   }
   editorDoc.body.insertBefore(domFragment, editorDoc.body.firstChild);
 
-  const signature = editorDoc.body.querySelector(".moz-signature");
-  const quote = editorDoc.body.querySelector(".moz-cite-prefix, blockquote[type='cite']");
+  const composeChildren = Array.from(editorDoc.body.children);
+  const signature = composeChildren.find(node => node.matches?.(".moz-signature"));
+  const quote = composeChildren.find(node => (
+    node.matches?.(".moz-cite-prefix, blockquote[type='cite']")
+  ));
   if (signature && quote && (signature.compareDocumentPosition(quote) & 2)) {
     editorDoc.body.insertBefore(signature, quote);
   }

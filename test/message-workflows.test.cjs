@@ -20,8 +20,12 @@ const apiSource = fs.readFileSync(path.join(
   "api.js"
 ), "utf8");
 
-function createReplyEditor(initialNames, { withSelection = true } = {}) {
+function createReplyEditor(initialNames, {
+  withSelection = true,
+  quoteChildren = [],
+} = {}) {
   const children = [];
+  const nodesByName = new Map();
   const body = {
     children,
     get firstChild() {
@@ -30,37 +34,70 @@ function createReplyEditor(initialNames, { withSelection = true } = {}) {
     insertBefore(node, referenceNode) {
       const nodes = node.isFragment ? [...node.children] : [node];
       for (const inserted of nodes) {
-        const oldIndex = this.children.indexOf(inserted);
-        if (oldIndex !== -1) this.children.splice(oldIndex, 1);
+        const oldParent = inserted.parentNode;
+        const oldIndex = oldParent?.children.indexOf(inserted) ?? -1;
+        if (oldIndex !== -1) oldParent.children.splice(oldIndex, 1);
       }
       const referenceIndex = referenceNode == null
         ? this.children.length
         : this.children.indexOf(referenceNode);
       assert.notEqual(referenceIndex, -1, "reference node belongs to the editor body");
       this.children.splice(referenceIndex, 0, ...nodes);
+      for (const inserted of nodes) inserted.parentNode = this;
       return node;
     },
     querySelector(selector) {
-      if (selector === ".moz-signature") {
-        return this.children.find(node => node.name === "signature") || null;
+      function findDescendant(nodes) {
+        for (const node of nodes) {
+          if (node.matches(selector)) return node;
+          const nestedMatch = findDescendant(node.children);
+          if (nestedMatch) return nestedMatch;
+        }
+        return null;
       }
-      if (selector === ".moz-cite-prefix, blockquote[type='cite']") {
-        return this.children.find(node => node.name === "quote") || null;
-      }
-      return null;
+      return findDescendant(this.children);
     },
   };
 
   function createNode(name) {
-    return {
+    const node = {
       name,
+      children: [],
+      parentNode: null,
+      matches(selector) {
+        if (selector === ".moz-signature") return this.name.endsWith("signature");
+        if (selector === ".moz-cite-prefix, blockquote[type='cite']") {
+          return this.name === "quote";
+        }
+        return false;
+      },
       compareDocumentPosition(other) {
-        return body.children.indexOf(other) < body.children.indexOf(this) ? 2 : 4;
+        function documentOrder(nodes, result = []) {
+          for (const child of nodes) {
+            result.push(child);
+            documentOrder(child.children, result);
+          }
+          return result;
+        }
+        const ordered = documentOrder(body.children);
+        return ordered.indexOf(other) < ordered.indexOf(this) ? 2 : 4;
       },
     };
+    nodesByName.set(name, node);
+    return node;
   }
 
-  for (const name of initialNames) children.push(createNode(name));
+  for (const name of initialNames) {
+    const node = createNode(name);
+    node.parentNode = body;
+    children.push(node);
+  }
+  const quote = nodesByName.get("quote");
+  for (const name of quoteChildren) {
+    const node = createNode(name);
+    node.parentNode = quote;
+    quote.children.push(node);
+  }
 
   const selection = withSelection ? {
     ranges: [{ startAfterNode: children.at(-1) || null }],
@@ -104,7 +141,13 @@ function createReplyEditor(initialNames, { withSelection = true } = {}) {
     },
   };
 
-  return { editorDoc, body, selection, originalChildren: [...children] };
+  return {
+    editorDoc,
+    body,
+    selection,
+    originalChildren: [...children],
+    nodesByName,
+  };
 }
 
 describe("conversation matching", () => {
@@ -269,6 +312,29 @@ describe("reply editor layout", () => {
     assert.equal(body.children[1], originalChildren[1]);
     assert.equal(body.children[2], originalChildren[0]);
     assert.equal(body.children.length, originalChildren.length + 1);
+  });
+
+  it("moves only the current compose signature and preserves a nested historical signature", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body, nodesByName } = createReplyEditor(["quote", "signature"], {
+      quoteChildren: ["historical-before", "historical-signature", "historical-after"],
+    });
+    const quote = nodesByName.get("quote");
+    const currentSignature = nodesByName.get("signature");
+    const historicalBefore = nodesByName.get("historical-before");
+    const historicalSignature = nodesByName.get("historical-signature");
+    const historicalAfter = nodesByName.get("historical-after");
+
+    insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "signature", "quote"]);
+    assert.equal(body.children[1], currentSignature);
+    assert.equal(body.children[2], quote);
+    assert.deepStrictEqual(
+      quote.children,
+      [historicalBefore, historicalSignature, historicalAfter]
+    );
+    assert.equal(historicalSignature.parentNode, quote);
   });
 
   it("keeps the direct-send reply body before its quote block", () => {

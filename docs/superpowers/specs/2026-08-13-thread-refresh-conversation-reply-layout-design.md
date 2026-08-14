@@ -86,7 +86,7 @@ The required order is:
 
 After insertion, the caret will be placed at the end of the new message block so the user can continue typing naturally.
 
-If expected signature or quote markers are missing, the extension will prepend the new block to the editor body and preserve every existing node. It will not delete, reconstruct, or move Thunderbird-generated content.
+If Thunderbird initially places the signature below the quote, the extension will move the existing signature node before the existing quote node so the required order wins. It will preserve every existing node and will not delete or reconstruct Thunderbird-generated content. If expected signature or quote markers are missing, it will prepend the new block without guessing at absent boundaries.
 
 The direct-send path will retain its hand-built quote block and ensure the same top-first body ordering. It cannot add a Thunderbird-managed signature, so that existing limitation remains documented.
 

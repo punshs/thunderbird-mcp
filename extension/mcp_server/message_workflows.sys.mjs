@@ -24,6 +24,58 @@ export function outlookThreadRoot(value) {
   }
 }
 
+export function createBoundedConversationScan(seedRecord, maxRecords) {
+  const limit = Math.max(1, Math.trunc(Number(maxRecords) || 1));
+  const records = [];
+  const seenIds = new Set();
+  let truncated = false;
+
+  function add(record) {
+    const id = normalizeMessageId(record?.id);
+    if (!id || seenIds.has(id)) return false;
+    if (records.length >= limit) {
+      truncated = true;
+      return false;
+    }
+    seenIds.add(id);
+    records.push({ ...record, id });
+    return true;
+  }
+
+  if (!add(seedRecord)) {
+    throw new TypeError("A bounded conversation scan requires a seed record with a message ID");
+  }
+
+  return {
+    records,
+    add,
+    has(messageId) {
+      return seenIds.has(normalizeMessageId(messageId));
+    },
+    markTruncated() {
+      truncated = true;
+    },
+    get truncated() {
+      return truncated;
+    },
+  };
+}
+
+export function finalizeConversationScan(resolved, scanTruncated, warnings = [], collectionCap = 10000) {
+  const mergedWarnings = [...warnings];
+  if (scanTruncated) {
+    const cap = Math.max(1, Math.trunc(Number(collectionCap) || 1));
+    mergedWarnings.push(
+      `Conversation scan stopped at the ${cap}-header collection cap; additional account messages may be omitted.`
+    );
+  }
+  return {
+    totalMessages: resolved.totalMessages,
+    truncated: Boolean(resolved.truncated || scanTruncated),
+    warnings: [...new Set(mergedWarnings)],
+  };
+}
+
 function haveSameOutlookThread(record, member) {
   const topic = String(record.threadTopic || "").trim();
   if (!topic || topic !== String(member.threadTopic || "").trim()) return false;

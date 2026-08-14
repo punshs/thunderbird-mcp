@@ -85,6 +85,39 @@ describe("conversation matching", () => {
     assert.equal(outlookMatch.members[1].matchReason, "outlook-thread");
   });
 
+  it("retains the seed when the bounded scan fills before traversal records", async () => {
+    const { createBoundedConversationScan } = await import(moduleUrl);
+    const scan = createBoundedConversationScan(
+      { id: "seed@test", folderPath: "imap://account/Archive" },
+      1
+    );
+
+    assert.equal(scan.add({ id: "<seed@test>", folderPath: "imap://account/Archive" }), false);
+    assert.equal(scan.truncated, false);
+    assert.equal(scan.add({ id: "other@test", folderPath: "imap://account/Inbox" }), false);
+    assert.deepStrictEqual(scan.records.map(record => record.id), ["seed@test"]);
+    assert.equal(scan.truncated, true);
+  });
+
+  it("marks capped account scans truncated and adds a bounded-scan warning", async () => {
+    const { finalizeConversationScan } = await import(moduleUrl);
+    const summary = finalizeConversationScan(
+      { totalMessages: 1, truncated: false },
+      true,
+      ["Raw headers unavailable for imap://account/Inbox"],
+      10_000
+    );
+
+    assert.deepStrictEqual(summary, {
+      totalMessages: 1,
+      truncated: true,
+      warnings: [
+        "Raw headers unavailable for imap://account/Inbox",
+        "Conversation scan stopped at the 10000-header collection cap; additional account messages may be omitted.",
+      ],
+    });
+  });
+
   it("dispatches getConversation through the async adapter", () => {
     assert.match(apiSource, /case "getConversation":\s*return await getConversation\(/);
   });

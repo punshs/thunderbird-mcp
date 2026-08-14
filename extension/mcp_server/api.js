@@ -72,6 +72,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       normalizeMessageId,
       parseMessageIdList,
       resolveConversationMembers,
+      createBoundedConversationScan,
+      finalizeConversationScan,
     } = ChromeUtils.importESModule(
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
@@ -3664,7 +3666,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (address) identityAddresses.add(address);
               }
 
-              const records = [];
               const rawCandidates = [];
               const warningSet = new Set();
               const root = account.incomingServer?.rootFolder;
@@ -3675,10 +3676,60 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 seedHdr.mime2DecodedSubject ||
                 seedHdr.subject
               );
-              let enumeratedHeaders = 0;
+
+              function makeRecord(msgHdr, folder) {
+                const references = [];
+                try {
+                  for (let i = 0; i < msgHdr.numReferences; i++) {
+                    references.push(msgHdr.getStringReference(i));
+                  }
+                } catch {}
+                const inReplyTo = msgHdr.getStringProperty("in-reply-to") || "";
+                const threadTopic = msgHdr.getStringProperty("thread-topic") || "";
+                const threadIndex = msgHdr.getStringProperty("thread-index") || "";
+                const subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                return {
+                  id: normalizeMessageId(msgHdr.messageId),
+                  inReplyTo,
+                  references: parseMessageIdList(references),
+                  threadTopic,
+                  threadIndex,
+                  subject,
+                  author,
+                  recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
+                  ccList: msgHdr.ccList || "",
+                  date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                  folder: folderDisplayName(folder),
+                  folderPath: folder.URI,
+                  read: msgHdr.isRead,
+                  flagged: msgHdr.isFlagged,
+                  tags: getUserTags(msgHdr),
+                  direction: identityAddresses.has(conversationAuthorAddress(author))
+                    ? "outgoing"
+                    : "incoming",
+                  _dateTs: msgHdr.date || 0,
+                };
+              }
+
+              function addRawCandidate(record, folder, msgHdr) {
+                const candidateTopic = normalizedConversationTopic(record.threadTopic || record.subject);
+                if (candidateTopic === seedTopic && (!record.threadTopic || !record.threadIndex)) {
+                  rawCandidates.push({ record, folder, msgHdr });
+                }
+              }
+
+              // Reserve one collection slot for the already-resolved seed before
+              // account traversal. A large earlier folder can therefore never
+              // make a valid request fail with "Seed message not found".
+              const seedRecord = makeRecord(seedHdr, seedFolder);
+              const scan = createBoundedConversationScan(seedRecord, SEARCH_COLLECTION_CAP);
+              const records = scan.records;
+              addRawCandidate(records[0], seedFolder, seedHdr);
+              let enumeratedHeaders = 1;
 
               function walk(folder) {
-                if (!folder || enumeratedHeaders >= SEARCH_COLLECTION_CAP) return;
+                if (!folder || scan.truncated) return;
 
                 let selectable = false;
                 try {
@@ -3690,48 +3741,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const db = folder.msgDatabase;
                     if (db) {
                       for (const msgHdr of db.enumerateMessages()) {
-                        if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) break;
+                        const id = normalizeMessageId(msgHdr.messageId);
+                        const isReservedSeed = folder.URI === seedFolder.URI &&
+                          id === seedRecord.id &&
+                          msgHdr.messageKey === seedHdr.messageKey;
+                        if (isReservedSeed) continue;
+                        if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) {
+                          scan.markTruncated();
+                          break;
+                        }
                         enumeratedHeaders++;
 
-                        const id = normalizeMessageId(msgHdr.messageId);
-                        if (!id) continue;
-                        const references = [];
-                        try {
-                          for (let i = 0; i < msgHdr.numReferences; i++) {
-                            references.push(msgHdr.getStringReference(i));
-                          }
-                        } catch {}
-                        const inReplyTo = msgHdr.getStringProperty("in-reply-to") || "";
-                        const threadTopic = msgHdr.getStringProperty("thread-topic") || "";
-                        const threadIndex = msgHdr.getStringProperty("thread-index") || "";
-                        const subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                        const record = {
-                          id,
-                          inReplyTo,
-                          references: parseMessageIdList(references),
-                          threadTopic,
-                          threadIndex,
-                          subject,
-                          author,
-                          recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
-                          ccList: msgHdr.ccList || "",
-                          date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                          folder: folderDisplayName(folder),
-                          folderPath: folder.URI,
-                          read: msgHdr.isRead,
-                          flagged: msgHdr.isFlagged,
-                          tags: getUserTags(msgHdr),
-                          direction: identityAddresses.has(conversationAuthorAddress(author))
-                            ? "outgoing"
-                            : "incoming",
-                          _dateTs: msgHdr.date || 0,
-                        };
-                        records.push(record);
-
-                        const candidateTopic = normalizedConversationTopic(threadTopic || subject);
-                        if (candidateTopic === seedTopic && (!threadTopic || !threadIndex)) {
-                          rawCandidates.push({ record, folder, msgHdr });
+                        if (!id || scan.has(id)) continue;
+                        const record = makeRecord(msgHdr, folder);
+                        if (scan.add(record)) {
+                          addRawCandidate(records[records.length - 1], folder, msgHdr);
                         }
                       }
                     }
@@ -3743,8 +3767,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   if (folder.hasSubFolders) {
                     for (const subfolder of folder.subFolders) {
-                      if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) break;
+                      if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) {
+                        scan.markTruncated();
+                        break;
+                      }
                       walk(subfolder);
+                      if (scan.truncated) break;
                     }
                   }
                 } catch {}
@@ -3773,7 +3801,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              return { account, records, warnings: [...warningSet] };
+              return {
+                account,
+                records,
+                warnings: [...warningSet],
+                collectionCapReached: scan.truncated,
+              };
             }
 
             async function getConversation(messageId, folderPath, maxMessages) {
@@ -3784,9 +3817,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const collected = collectConversationRecords(found.msgHdr, found.folder);
                 if (collected.error) return collected;
-                const { account, records, warnings } = collected;
+                const { account, records, warnings, collectionCapReached } = collected;
                 const resolved = resolveConversationMembers(records, seedMessageId, maxMessages);
                 if (resolved.error) return resolved;
+
+                const scanSummary = finalizeConversationScan(
+                  resolved,
+                  collectionCapReached,
+                  warnings,
+                  SEARCH_COLLECTION_CAP
+                );
 
                 const messages = resolved.members.sort((a, b) => a._dateTs - b._dateTs);
                 for (const message of messages) delete message._dateTs;
@@ -3794,9 +3834,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return {
                   seedMessageId,
                   accountId: account.key,
-                  totalMessages: resolved.totalMessages,
-                  truncated: resolved.truncated,
-                  warnings,
+                  totalMessages: scanSummary.totalMessages,
+                  truncated: scanSummary.truncated,
+                  warnings: scanSummary.warnings,
                   messages,
                 };
               } catch (e) {

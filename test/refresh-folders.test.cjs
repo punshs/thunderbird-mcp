@@ -164,6 +164,17 @@ describe("folder refresh result aggregation", () => {
         counts: { attempted: 2, refreshed: 1, failed: 0, timedOut: 0, skipped: 1 },
       },
     },
+    {
+      name: "treats an unknown folder status as a failed aggregate",
+      results: [
+        { status: "refreshed" },
+        { status: "unexpected_status" },
+      ],
+      expected: {
+        success: false,
+        counts: { attempted: 2, refreshed: 1, failed: 1, timedOut: 0, skipped: 0 },
+      },
+    },
   ]) {
     it(name, async () => {
       const { summarizeRefreshResults } = await loadRefreshExports();
@@ -412,5 +423,86 @@ describe("folder selection and orchestration", () => {
       { accountId: "account-a", folderPath: inbox.URI, serverType: "imap", status: "refreshed" },
       { accountId: "account-a", folderPath: sent.URI, serverType: "imap", status: "refreshed" },
     ]);
+  });
+
+  it("skips remaining same-account folders after a timeout while continuing other accounts", async () => {
+    const exports = await loadRefreshExports();
+    const starts = [];
+    const listeners = new Map();
+    const aInbox = makeFolder({
+      uri: "imap://a/Inbox",
+      accountId: "account-a",
+      flags: FLAGS.inbox,
+      serverType: "imap",
+    });
+    const aSent = makeFolder({
+      uri: "imap://a/Sent",
+      accountId: "account-a",
+      flags: FLAGS.sent,
+      serverType: "imap",
+    });
+    const bInbox = makeFolder({
+      uri: "imap://b/Inbox",
+      accountId: "account-b",
+      flags: FLAGS.inbox,
+      serverType: "imap",
+    });
+    for (const folder of [aInbox, aSent, bInbox]) {
+      folder.imapInterface = {
+        updateFolderWithListener(_msgWindow, listener) {
+          starts.push(folder.URI);
+          listeners.set(folder.URI, listener);
+        },
+      };
+    }
+    const harness = makeHarness(exports.createFolderRefreshWorkflow, exports.summarizeRefreshResults, {
+      accessibleAccounts: [
+        makeAccount("account-a", [aInbox, aSent]),
+        makeAccount("account-b", [bInbox]),
+      ],
+    });
+
+    const pending = harness.workflow.refreshFolders();
+    assert.deepStrictEqual(starts, [aInbox.URI]);
+
+    harness.timers[0].callback();
+    await Promise.resolve();
+    assert.deepStrictEqual(starts, [aInbox.URI, bInbox.URI]);
+
+    listeners.get(bInbox.URI).OnStopRunningUrl(null, 0);
+    const result = await pending;
+    assert.deepStrictEqual(result.folders.map(folder => ({
+      accountId: folder.accountId,
+      folderPath: folder.folderPath,
+      status: folder.status,
+      error: folder.error,
+    })), [
+      {
+        accountId: "account-a",
+        folderPath: aInbox.URI,
+        status: "timed_out",
+        error: "Folder refresh timed out after 15000 ms",
+      },
+      {
+        accountId: "account-a",
+        folderPath: aSent.URI,
+        status: "skipped",
+        error: "Skipped because another folder refresh for account account-a timed out and may still be running",
+      },
+      {
+        accountId: "account-b",
+        folderPath: bInbox.URI,
+        status: "refreshed",
+        error: undefined,
+      },
+    ]);
+    assert.deepStrictEqual(result.counts, {
+      attempted: 3,
+      refreshed: 1,
+      failed: 0,
+      timedOut: 1,
+      skipped: 1,
+    });
+    assert.equal(result.success, false);
   });
 });

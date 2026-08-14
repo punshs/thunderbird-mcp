@@ -72,7 +72,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       normalizeMessageId,
       parseMessageIdList,
       resolveConversationMembers,
-      createBoundedConversationScan,
+      collectConversationFolderRecords,
       finalizeConversationScan,
       summarizeRefreshResults,
       createFolderRefreshWorkflow,
@@ -3479,8 +3479,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * headers are broken but which TB has stitched by subject. The
              * tradeoff is that threads are folder-local: a reply sitting in Sent
              * or Archive lives in a different msgDatabase and will not appear.
-             * Callers wanting cross-folder assembly should searchMessages on the
-             * subject instead.
+             * Callers wanting exact cross-folder assembly should use
+             * getConversation instead.
              *
              * Returns headers only. Bodies are deliberately excluded -- a long
              * thread would blow the response budget; use getMessage per id.
@@ -3779,66 +3779,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              // Reserve one collection slot for the already-resolved seed before
-              // account traversal. A large earlier folder can therefore never
-              // make a valid request fail with "Seed message not found".
               const seedRecord = makeRecord(seedHdr, seedFolder);
-              const scan = createBoundedConversationScan(seedRecord, SEARCH_COLLECTION_CAP);
-              const records = scan.records;
-              addRawCandidate(records[0], seedFolder, seedHdr);
-              let enumeratedHeaders = 1;
-
-              function walk(folder) {
-                if (!folder || scan.truncated) return;
-
-                let selectable = false;
-                try {
-                  selectable = !folder.isServer && !(folder.flags & virtualFlag) && !folder.noSelect;
-                } catch {}
-
-                if (selectable) {
-                  try {
-                    const db = folder.msgDatabase;
-                    if (db) {
-                      for (const msgHdr of db.enumerateMessages()) {
-                        const id = normalizeMessageId(msgHdr.messageId);
-                        const isReservedSeed = folder.URI === seedFolder.URI &&
-                          id === seedRecord.id &&
-                          msgHdr.messageKey === seedHdr.messageKey;
-                        if (isReservedSeed) continue;
-                        if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) {
-                          scan.markTruncated();
-                          break;
-                        }
-                        enumeratedHeaders++;
-
-                        if (!id || scan.has(id)) continue;
-                        const record = makeRecord(msgHdr, folder);
-                        if (scan.add(record)) {
-                          addRawCandidate(records[records.length - 1], folder, msgHdr);
-                        }
-                      }
-                    }
-                  } catch {
-                    // Skip inaccessible folder databases.
-                  }
-                }
-
-                try {
-                  if (folder.hasSubFolders) {
-                    for (const subfolder of folder.subFolders) {
-                      if (enumeratedHeaders >= SEARCH_COLLECTION_CAP) {
-                        scan.markTruncated();
-                        break;
-                      }
-                      walk(subfolder);
-                      if (scan.truncated) break;
-                    }
-                  }
-                } catch {}
-              }
-
-              walk(root);
+              const collection = collectConversationFolderRecords({
+                rootFolder: root,
+                seedFolder,
+                seedHeader: seedHdr,
+                seedRecord,
+                maxRecords: SEARCH_COLLECTION_CAP,
+                sentFlag: Ci.nsMsgFolderFlags.SentMail,
+                virtualFlag,
+                getMessageId: msgHdr => msgHdr.messageId,
+                isSeedHeader(msgHdr, folder) {
+                  return folder.URI === seedFolder.URI &&
+                    normalizeMessageId(msgHdr.messageId) === seedRecord.id &&
+                    msgHdr.messageKey === seedHdr.messageKey;
+                },
+                makeRecord,
+                onRecord: addRawCandidate,
+              });
+              const { records } = collection;
 
               for (const { record, folder, msgHdr } of rawCandidates) {
                 const headerBlock = readConversationHeaderBlock(folder, msgHdr);
@@ -3864,8 +3823,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return {
                 account,
                 records,
-                warnings: [...warningSet],
-                collectionCapReached: scan.truncated,
+                warnings: [...warningSet, ...collection.warnings],
+                diagnostics: collection.diagnostics,
+                collectionCapReached: collection.collectionCapReached,
+                collectionIncomplete: collection.collectionIncomplete,
               };
             }
 
@@ -3877,7 +3838,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const collected = collectConversationRecords(found.msgHdr, found.folder);
                 if (collected.error) return collected;
-                const { account, records, warnings, collectionCapReached } = collected;
+                const {
+                  account,
+                  records,
+                  warnings,
+                  diagnostics,
+                  collectionCapReached,
+                  collectionIncomplete,
+                } = collected;
                 const resolved = resolveConversationMembers(records, seedMessageId, maxMessages);
                 if (resolved.error) return resolved;
 
@@ -3885,7 +3853,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   resolved,
                   collectionCapReached,
                   warnings,
-                  SEARCH_COLLECTION_CAP
+                  SEARCH_COLLECTION_CAP,
+                  collectionIncomplete
                 );
 
                 const messages = resolved.members.sort((a, b) => a._dateTs - b._dateTs);
@@ -3897,6 +3866,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   totalMessages: scanSummary.totalMessages,
                   truncated: scanSummary.truncated,
                   warnings: scanSummary.warnings,
+                  diagnostics,
                   messages,
                 };
               } catch (e) {

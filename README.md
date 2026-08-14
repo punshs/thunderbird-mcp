@@ -194,7 +194,7 @@ That's it. Your AI can now access Thunderbird.
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
-| Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
+| Missing recent emails | Call `refreshFolders` for Inbox and Sent, then inspect its per-folder completion statuses before reading. For a persistent local database problem, right-click the folder > Properties > Repair Folder. |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
 | `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
@@ -240,6 +240,7 @@ thunderbird-mcp/
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
 │       ├── api.js              # All 39 MCP tools + auth + access control
+│       ├── message_workflows.sys.mjs # Conversation, refresh, and reply-layout workflows
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
@@ -249,7 +250,7 @@ thunderbird-mcp/
 
 ## Known issues
 
-- IMAP folder databases can be stale until you click on them in Thunderbird
+- Remote folder databases can be stale until an explicit `refreshFolders` call completes; timed-out updates may continue in Thunderbird, so later same-account folders are reported as skipped for that call
 - HTML-only emails are converted to plain text (original formatting is lost)
 - Recurring calendar event CRUD operates on the series, not individual occurrences
 - IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after

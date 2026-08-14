@@ -75,6 +75,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       createBoundedConversationScan,
       finalizeConversationScan,
       summarizeRefreshResults,
+      createFolderRefreshWorkflow,
     } = ChromeUtils.importESModule(
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
@@ -1125,6 +1126,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result;
             }
 
+            const { refreshFolders } = createFolderRefreshWorkflow({
+              inboxFlag: Ci.nsMsgFolderFlags.Inbox,
+              sentFlag: Ci.nsMsgFolderFlags.SentMail,
+              virtualFlag: Ci.nsMsgFolderFlags.Virtual,
+              getAccessibleFolder,
+              getAccessibleAccounts,
+              isAccountAllowed,
+              getAccount(accountId) {
+                try {
+                  return MailServices.accounts.getAccount(accountId);
+                } catch {
+                  return null;
+                }
+              },
+              getAccountIdForFolder(folder) {
+                return MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown";
+              },
+              queryImapFolder(folder) {
+                try {
+                  return folder.QueryInterface(Ci.nsIMsgImapMailFolder);
+                } catch {
+                  return null;
+                }
+              },
+              makeUrlListener(listener) {
+                return {
+                  QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                  ...listener,
+                };
+              },
+              makeFolderListener(listener) {
+                return {
+                  QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                  ...listener,
+                };
+              },
+              scheduleTimeout(callback, timeoutMs) {
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.initWithCallback(callback, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                return () => timer.cancel();
+              },
+              isSuccessCode(statusCode) {
+                return Components.isSuccessCode(statusCode);
+              },
+              summarizeRefreshResults,
+            });
+
             function listAccounts() {
               const accounts = [];
               for (const account of getAccessibleAccounts()) {
@@ -1273,191 +1321,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               return results;
-            }
-
-            function selectRefreshFolders(accountId, folderPath, recursive) {
-              const selected = [];
-              const selectedUris = new Set();
-              const inboxFlag = Ci.nsMsgFolderFlags.Inbox;
-              const sentFlag = Ci.nsMsgFolderFlags.SentMail;
-              const virtualFlag = Ci.nsMsgFolderFlags.Virtual;
-
-              function addFolder(folder) {
-                try {
-                  if (!folder || folder.isServer || (folder.flags & virtualFlag) || folder.noSelect) {
-                    return;
-                  }
-                  if (!folder.URI || selectedUris.has(folder.URI)) return;
-                  selectedUris.add(folder.URI);
-                  selected.push(folder);
-                } catch {
-                  // Skip folders whose selection properties cannot be read.
-                }
-              }
-
-              function walkDescendants(folder, visit) {
-                try {
-                  if (!folder?.hasSubFolders) return;
-                  for (const subfolder of folder.subFolders) {
-                    visit(subfolder);
-                    walkDescendants(subfolder, visit);
-                  }
-                } catch {
-                  // Skip descendants that cannot be enumerated.
-                }
-              }
-
-              if (folderPath) {
-                const resolved = getAccessibleFolder(folderPath);
-                if (resolved.error) return resolved;
-                addFolder(resolved.folder);
-                if (recursive === true) {
-                  walkDescendants(resolved.folder, addFolder);
-                }
-                return selected;
-              }
-
-              let accounts;
-              if (accountId) {
-                if (!isAccountAllowed(accountId)) {
-                  return { error: `Account not accessible: ${accountId}` };
-                }
-                let account = null;
-                try {
-                  account = MailServices.accounts.getAccount(accountId);
-                } catch {}
-                if (!account) return { error: `Account not found: ${accountId}` };
-                accounts = [account];
-              } else {
-                accounts = getAccessibleAccounts();
-              }
-
-              for (const account of accounts) {
-                const root = account.incomingServer?.rootFolder;
-                if (!root) continue;
-                const addSpecialFolder = folder => {
-                  try {
-                    if (folder.flags & (inboxFlag | sentFlag)) addFolder(folder);
-                  } catch {}
-                };
-                addSpecialFolder(root);
-                walkDescendants(root, addSpecialFolder);
-              }
-              return selected;
-            }
-
-            function refreshOneFolder(folder, timeoutMs) {
-              const startedAt = Date.now();
-              const serverType = folder.server?.type || "unknown";
-              let accountId = "unknown";
-              try {
-                accountId = MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown";
-              } catch {}
-              const baseResult = {
-                accountId,
-                folderPath: folder.URI,
-                serverType,
-              };
-
-              if (serverType === "none" || serverType === "pop3") {
-                return Promise.resolve({
-                  ...baseResult,
-                  status: "skipped",
-                  elapsedMs: Date.now() - startedAt,
-                });
-              }
-
-              const numericTimeout = Number(timeoutMs);
-              const boundedTimeout = Number.isFinite(numericTimeout)
-                ? Math.max(1_000, Math.min(60_000, Math.trunc(numericTimeout)))
-                : 15_000;
-
-              return new Promise(resolve => {
-                let settled = false;
-                let timer = null;
-                let folderListener = null;
-                const targetFolderUri = folder.URI;
-
-                function finish(status, error) {
-                  if (settled) return;
-                  settled = true;
-                  try { timer?.cancel(); } catch {}
-                  if (folderListener) {
-                    try { folder.RemoveFolderListener(folderListener); } catch {}
-                  }
-                  resolve({
-                    ...baseResult,
-                    status,
-                    elapsedMs: Date.now() - startedAt,
-                    ...(error ? { error } : {}),
-                  });
-                }
-
-                try {
-                  timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  timer.initWithCallback(
-                    () => finish("timed_out", `Folder refresh timed out after ${boundedTimeout} ms`),
-                    boundedTimeout,
-                    Ci.nsITimer.TYPE_ONE_SHOT
-                  );
-
-                  let imapFolder = null;
-                  try {
-                    imapFolder = folder.QueryInterface(Ci.nsIMsgImapMailFolder);
-                  } catch {}
-
-                  if (imapFolder) {
-                    const urlListener = {
-                      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                      OnStartRunningUrl() {},
-                      OnStopRunningUrl(_url, statusCode) {
-                        if (Components.isSuccessCode(statusCode)) {
-                          finish("refreshed");
-                        } else {
-                          finish("failed", `Update folder failed with status 0x${statusCode.toString(16)}`);
-                        }
-                      },
-                    };
-                    imapFolder.updateFolderWithListener(null, urlListener);
-                    return;
-                  }
-
-                  folderListener = {
-                    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
-                    onFolderAdded() {},
-                    onMessageAdded() {},
-                    onFolderRemoved() {},
-                    onMessageRemoved() {},
-                    onFolderPropertyChanged() {},
-                    onFolderIntPropertyChanged() {},
-                    onFolderBoolPropertyChanged() {},
-                    onFolderPropertyFlagChanged() {},
-                    onFolderEvent(folder, event) {
-                      if (folder.URI === targetFolderUri && event === "FolderLoaded") {
-                        finish("refreshed");
-                      }
-                    },
-                  };
-                  folder.AddFolderListener(folderListener);
-                  folder.updateFolder(null);
-                } catch (error) {
-                  finish("failed", error?.message || String(error));
-                }
-              });
-            }
-
-            async function refreshFolders(accountId, folderPath, recursive, timeoutMs) {
-              const selection = selectRefreshFolders(accountId, folderPath, recursive);
-              if (selection.error) return selection;
-
-              const results = [];
-              for (const folder of selection) {
-                results.push(await refreshOneFolder(folder, timeoutMs));
-              }
-              return {
-                ...summarizeRefreshResults(results),
-                folders: results,
-              };
             }
 
             /**

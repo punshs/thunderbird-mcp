@@ -96,6 +96,197 @@ export function summarizeRefreshResults(results) {
   };
 }
 
+export function createFolderRefreshWorkflow({
+  inboxFlag,
+  sentFlag,
+  virtualFlag,
+  getAccessibleFolder,
+  getAccessibleAccounts,
+  isAccountAllowed,
+  getAccount,
+  getAccountIdForFolder,
+  queryImapFolder,
+  makeUrlListener = listener => listener,
+  makeFolderListener = listener => listener,
+  scheduleTimeout,
+  isSuccessCode,
+  now = Date.now,
+  summarizeRefreshResults: summarizeResults,
+}) {
+  function selectRefreshFolders(accountId, folderPath, recursive) {
+    const selected = [];
+    const selectedUris = new Set();
+
+    function addFolder(folder) {
+      try {
+        if (!folder || folder.isServer || (folder.flags & virtualFlag) || folder.noSelect) {
+          return;
+        }
+        if (!folder.URI || selectedUris.has(folder.URI)) return;
+        selectedUris.add(folder.URI);
+        selected.push(folder);
+      } catch {
+        // Skip folders whose selection properties cannot be read.
+      }
+    }
+
+    function walkDescendants(folder, visit) {
+      try {
+        if (!folder?.hasSubFolders) return;
+        for (const subfolder of folder.subFolders) {
+          visit(subfolder);
+          walkDescendants(subfolder, visit);
+        }
+      } catch {
+        // Skip descendants that cannot be enumerated.
+      }
+    }
+
+    if (folderPath) {
+      const resolved = getAccessibleFolder(folderPath);
+      if (resolved.error) return resolved;
+      addFolder(resolved.folder);
+      if (recursive === true) {
+        walkDescendants(resolved.folder, addFolder);
+      }
+      return selected;
+    }
+
+    let accounts;
+    if (accountId) {
+      if (!isAccountAllowed(accountId)) {
+        return { error: `Account not accessible: ${accountId}` };
+      }
+      const account = getAccount(accountId);
+      if (!account) return { error: `Account not found: ${accountId}` };
+      accounts = [account];
+    } else {
+      accounts = getAccessibleAccounts();
+    }
+
+    for (const account of accounts) {
+      const root = account.incomingServer?.rootFolder;
+      if (!root) continue;
+      const addSpecialFolder = folder => {
+        try {
+          if (folder.flags & (inboxFlag | sentFlag)) addFolder(folder);
+        } catch {}
+      };
+      addSpecialFolder(root);
+      walkDescendants(root, addSpecialFolder);
+    }
+    return selected;
+  }
+
+  function refreshOneFolder(folder, timeoutMs) {
+    const startedAt = now();
+    const serverType = folder.server?.type || "unknown";
+    let accountId = "unknown";
+    try {
+      accountId = getAccountIdForFolder(folder) || "unknown";
+    } catch {}
+    const baseResult = {
+      accountId,
+      folderPath: folder.URI,
+      serverType,
+    };
+
+    if (serverType === "none" || serverType === "pop3") {
+      return Promise.resolve({
+        ...baseResult,
+        status: "skipped",
+        elapsedMs: now() - startedAt,
+      });
+    }
+
+    const numericTimeout = Number(timeoutMs);
+    const boundedTimeout = Number.isFinite(numericTimeout)
+      ? Math.max(1_000, Math.min(60_000, Math.trunc(numericTimeout)))
+      : 15_000;
+
+    return new Promise(resolve => {
+      let settled = false;
+      let cancelTimer = null;
+      let folderListener = null;
+      const targetFolderUri = folder.URI;
+
+      function finish(status, error) {
+        if (settled) return;
+        settled = true;
+        try { cancelTimer?.(); } catch {}
+        if (folderListener) {
+          try { folder.RemoveFolderListener(folderListener); } catch {}
+        }
+        resolve({
+          ...baseResult,
+          status,
+          elapsedMs: now() - startedAt,
+          ...(error ? { error } : {}),
+        });
+      }
+
+      try {
+        cancelTimer = scheduleTimeout(
+          () => finish("timed_out", `Folder refresh timed out after ${boundedTimeout} ms`),
+          boundedTimeout
+        );
+
+        const imapFolder = queryImapFolder(folder);
+        if (imapFolder) {
+          const urlListener = makeUrlListener({
+            OnStartRunningUrl() {},
+            OnStopRunningUrl(_url, statusCode) {
+              if (isSuccessCode(statusCode)) {
+                finish("refreshed");
+              } else {
+                finish("failed", `Update folder failed with status 0x${statusCode.toString(16)}`);
+              }
+            },
+          });
+          imapFolder.updateFolderWithListener(null, urlListener);
+          return;
+        }
+
+        folderListener = makeFolderListener({
+          onFolderAdded() {},
+          onMessageAdded() {},
+          onFolderRemoved() {},
+          onMessageRemoved() {},
+          onFolderPropertyChanged() {},
+          onFolderIntPropertyChanged() {},
+          onFolderBoolPropertyChanged() {},
+          onFolderPropertyFlagChanged() {},
+          onFolderEvent(eventFolder, event) {
+            if (eventFolder.URI === targetFolderUri && event === "FolderLoaded") {
+              finish("refreshed");
+            }
+          },
+        });
+        folder.AddFolderListener(folderListener);
+        folder.updateFolder(null);
+      } catch (error) {
+        finish("failed", error?.message || String(error));
+      }
+    });
+  }
+
+  async function refreshFolders(accountId, folderPath, recursive, timeoutMs) {
+    const selection = selectRefreshFolders(accountId, folderPath, recursive);
+    if (selection.error) return selection;
+
+    const results = [];
+    for (const folder of selection) {
+      results.push(await refreshOneFolder(folder, timeoutMs));
+    }
+    return {
+      ...summarizeResults(results),
+      folders: results,
+    };
+  }
+
+  return { selectRefreshFolders, refreshOneFolder, refreshFolders };
+}
+
 function haveSameOutlookThread(record, member) {
   const topic = String(record.threadTopic || "").trim();
   if (!topic || topic !== String(member.threadTopic || "").trim()) return false;

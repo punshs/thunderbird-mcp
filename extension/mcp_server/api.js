@@ -76,6 +76,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       finalizeConversationScan,
       summarizeRefreshResults,
       createFolderRefreshWorkflow,
+      insertReplyHtmlAtTop,
     } = ChromeUtils.importESModule(
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
@@ -1629,14 +1630,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const browser = typeof composeWin.getBrowser === "function" ? composeWin.getBrowser() : null;
               const editorDoc = browser?.contentDocument;
-              if (editorDoc && typeof editorDoc.execCommand === "function") {
-                editorDoc.execCommand("insertHTML", false, fragment);
-              } else {
-                const editor = typeof composeWin.GetCurrentEditor === "function" ? composeWin.GetCurrentEditor() : null;
-                if (editor && typeof editor.insertHTML === "function") {
-                  editor.insertHTML(fragment);
-                }
-              }
+              if (!editorDoc) throw new Error("Reply editor is not ready");
+              insertReplyHtmlAtTop(editorDoc, fragment);
 
               if (composeWin.gMsgCompose) {
                 composeWin.gMsgCompose.bodyModified = true;
@@ -2179,7 +2174,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Wrap composed body HTML so it inherits Outlook's default font
              * instead of the recipient client's. Returns a bare div, safe to
-             * nest inside <body> or to hand to execCommand("insertHTML").
+             * nest inside <body> or insert into Thunderbird's compose body.
              */
             function wrapOutlookBody(html) {
               if (!html) return "";

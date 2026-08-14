@@ -20,6 +20,93 @@ const apiSource = fs.readFileSync(path.join(
   "api.js"
 ), "utf8");
 
+function createReplyEditor(initialNames, { withSelection = true } = {}) {
+  const children = [];
+  const body = {
+    children,
+    get firstChild() {
+      return this.children[0] || null;
+    },
+    insertBefore(node, referenceNode) {
+      const nodes = node.isFragment ? [...node.children] : [node];
+      for (const inserted of nodes) {
+        const oldIndex = this.children.indexOf(inserted);
+        if (oldIndex !== -1) this.children.splice(oldIndex, 1);
+      }
+      const referenceIndex = referenceNode == null
+        ? this.children.length
+        : this.children.indexOf(referenceNode);
+      assert.notEqual(referenceIndex, -1, "reference node belongs to the editor body");
+      this.children.splice(referenceIndex, 0, ...nodes);
+      return node;
+    },
+    querySelector(selector) {
+      if (selector === ".moz-signature") {
+        return this.children.find(node => node.name === "signature") || null;
+      }
+      if (selector === ".moz-cite-prefix, blockquote[type='cite']") {
+        return this.children.find(node => node.name === "quote") || null;
+      }
+      return null;
+    },
+  };
+
+  function createNode(name) {
+    return {
+      name,
+      compareDocumentPosition(other) {
+        return body.children.indexOf(other) < body.children.indexOf(this) ? 2 : 4;
+      },
+    };
+  }
+
+  for (const name of initialNames) children.push(createNode(name));
+
+  const selection = withSelection ? {
+    ranges: [{ startAfterNode: children.at(-1) || null }],
+    removeAllRanges() {
+      this.ranges.length = 0;
+    },
+    addRange(range) {
+      this.ranges.push(range);
+    },
+  } : null;
+
+  const editorDoc = {
+    body,
+    createRange() {
+      return {
+        selectNodeContents(node) {
+          this.selectedNode = node;
+        },
+        collapse(toStart) {
+          this.collapsedToStart = toStart;
+        },
+        createContextualFragment(fragmentHtml) {
+          assert.equal(fragmentHtml, "<div>reply</div>");
+          const aptos = createNode("aptos");
+          return {
+            isFragment: true,
+            children: [aptos],
+            firstChild: aptos,
+            lastChild: aptos,
+          };
+        },
+        setStartAfter(node) {
+          this.startAfterNode = node;
+        },
+      };
+    },
+    defaultView: {
+      getSelection() {
+        return selection;
+      },
+    },
+  };
+
+  return { editorDoc, body, selection, originalChildren: [...children] };
+}
+
 describe("conversation matching", () => {
   const outlookThreadIndex = (rootByte, childByte) => Buffer.concat([
     Buffer.alloc(22, rootByte),
@@ -120,5 +207,74 @@ describe("conversation matching", () => {
 
   it("dispatches getConversation through the async adapter", () => {
     assert.match(apiSource, /case "getConversation":\s*return await getConversation\(/);
+  });
+});
+
+describe("reply editor layout", () => {
+  it("inserts the Aptos body before the existing signature and quote and moves the caret", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body, selection, originalChildren } = createReplyEditor([
+      "signature",
+      "quote",
+    ]);
+
+    const { insertedNode } = insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "signature", "quote"]);
+    assert.equal(insertedNode.name, "aptos");
+    assert.equal(selection.ranges[0].startAfterNode.name, "aptos");
+    assert.equal(selection.ranges.length, 1);
+    assert.equal(body.children[1], originalChildren[0]);
+    assert.equal(body.children[2], originalChildren[1]);
+  });
+
+  it("inserts before a quote when there is no signature", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body, originalChildren } = createReplyEditor(["quote"]);
+
+    insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "quote"]);
+    assert.equal(body.children[1], originalChildren[0]);
+  });
+
+  it("inserts into an empty editor body", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body, selection } = createReplyEditor([]);
+
+    insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos"]);
+    assert.equal(selection.ranges[0].startAfterNode.name, "aptos");
+  });
+
+  it("inserts when the editor has no selection", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body } = createReplyEditor(["signature", "quote"], {
+      withSelection: false,
+    });
+
+    insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "signature", "quote"]);
+  });
+
+  it("moves an existing signature before a quote without replacing either node", async () => {
+    const { insertReplyHtmlAtTop } = await import(moduleUrl);
+    const { editorDoc, body, originalChildren } = createReplyEditor(["quote", "signature"]);
+
+    insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
+
+    assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "signature", "quote"]);
+    assert.equal(body.children[1], originalChildren[1]);
+    assert.equal(body.children[2], originalChildren[0]);
+    assert.equal(body.children.length, originalChildren.length + 1);
+  });
+
+  it("keeps the direct-send reply body before its quote block", () => {
+    assert.match(
+      apiSource,
+      /composeFields\.body = `<html><head><meta charset="UTF-8"><\/head><body>\$\{wrapOutlookBody\(formatBodyHtml\(body, isHtml\)\)\}\$\{quoteBlock\}<\/body><\/html>`;/
+    );
   });
 });

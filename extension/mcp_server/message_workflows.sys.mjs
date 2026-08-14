@@ -1,3 +1,33 @@
+export function insertReplyHtmlAtTop(editorDoc, fragmentHtml) {
+  if (!editorDoc?.body || !fragmentHtml) throw new Error("Reply editor is not ready");
+  const insertionRange = editorDoc.createRange();
+  insertionRange.selectNodeContents(editorDoc.body);
+  insertionRange.collapse(true);
+  const domFragment = insertionRange.createContextualFragment(fragmentHtml);
+  const insertedNode = domFragment.firstChild;
+  const insertedLastNode = domFragment.lastChild;
+  if (!insertedNode || !insertedLastNode) {
+    throw new Error("Reply body produced no editable content");
+  }
+  editorDoc.body.insertBefore(domFragment, editorDoc.body.firstChild);
+
+  const signature = editorDoc.body.querySelector(".moz-signature");
+  const quote = editorDoc.body.querySelector(".moz-cite-prefix, blockquote[type='cite']");
+  if (signature && quote && (signature.compareDocumentPosition(quote) & 2)) {
+    editorDoc.body.insertBefore(signature, quote);
+  }
+
+  const selection = editorDoc.defaultView?.getSelection?.();
+  if (selection) {
+    const caretRange = editorDoc.createRange();
+    caretRange.setStartAfter(insertedLastNode);
+    caretRange.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(caretRange);
+  }
+  return { insertedNode };
+}
+
 export function normalizeMessageId(value) {
   const text = String(value || "").trim();
   return text.startsWith("<") && text.endsWith(">")

@@ -2,11 +2,11 @@
 
 Public fork of [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp), retaining the upstream MIT license and attribution. This branch integrates upstream v0.7.5 with cross-folder conversations, explicit completed folder refresh, folder-local threads, Snap discovery fixes, and Outlook-style HTML replies. Plain-text composition follows upstream format settings. Upstream automatic add-on updates are disabled so they cannot replace the fork; install fork builds manually.
 
-The bridge uses upstream protocol negotiation and metadata-only debug logging. Earlier experimental full-payload trace logging is superseded to avoid logging message content. The proposed open-draft editing and duplicate-prevention tools are not yet implemented.
+The bridge uses upstream protocol negotiation and metadata-only debug logging. Earlier experimental full-payload trace logging is superseded to avoid logging message content. Open-draft editing is available through the four compose-window tools below. Automatic duplicate prevention and persistent send-status tracking remain future work.
 
 
 [![CI](https://github.com/punshs/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/punshs/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/43_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/47_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -23,7 +23,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 43 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 47 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
 
@@ -70,6 +70,10 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 
 | Tool | Description |
 |------|-------------|
+| `listComposeWindows` | List accessible open drafts with unique IDs, revisions, subjects, recipients and attachment metadata. |
+| `getComposeWindow` | Read a particular open draft, including its current body, source-message URI, saved-draft URI and revision. |
+| `updateComposeWindow` | Change selected fields in an existing window; reject stale revisions and preserve untouched fields. Does not send or save. |
+| `saveComposeWindow` | Save the observed revision to Drafts and leave it open; never sends or queues mail. |
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
@@ -248,7 +252,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 43 MCP tools + auth + access control
+│       ├── api.js              # All 47 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
@@ -272,3 +276,15 @@ thunderbird-mcp/
 ## License
 
 MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
+
+## Editing an open draft
+
+1. Call `listComposeWindows` to identify the existing window, then `getComposeWindow` to read its current content and revision.
+2. Pass its `composeId`, `expectedRevision`, and a `changes` object to `updateComposeWindow`. Supported fields are `subject`, `to`, `cc`, `bcc`, `body` (HTML windows), and `plainTextBody` (plain-text windows). Address fields are arrays; omitted fields stay unchanged. Sender identity, attachments, threading and compose format cannot be changed by this tool.
+3. A body update replaces the **entire body**, including any signature and quoted correspondence. Preserve those from the read result when revising only the reply text. A subject-only change leaves the body untouched.
+4. If a draft changed since it was read, reread and reconcile instead of retrying with an old revision. Updates serialize per window and briefly lock its editor; account access is checked again before mutation.
+5. Call `saveComposeWindow` with the latest revision when a saved draft is wanted. It leaves the window open and returns Thunderbird's native save receipt. Saving may change draft metadata; reread before another operation.
+
+Compose IDs/revisions last only for the extension session. Closed or inaccessible windows are rejected. Listing reports per-window read errors rather than hiding a partial result. These tools neither send nor close drafts; listing existing replies helps an assistant avoid creating duplicates, but automatic deduplication is not implemented.
+
+Validated with unit tests and an isolated Thunderbird profile containing dummy mail. Activation of this experiment-API add-on may require restarting Thunderbird; save real open drafts before restarting.

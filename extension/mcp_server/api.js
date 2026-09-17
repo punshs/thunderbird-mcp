@@ -1036,6 +1036,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
 
+    const { createComposeWindowWorkflow, createThunderbirdComposeHost } = ChromeUtils.importESModule(
+      "resource://thunderbird-mcp/mcp_server/compose_windows.sys.mjs"
+    );
+
     function normalizeGetMessagesLimit(value) {
       const limit = Number(value);
       if (!Number.isInteger(limit)) return DEFAULT_GET_MESSAGES_LIMIT;
@@ -1243,6 +1247,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           },
           required: ["messageId", "folderPath"],
         },
+      },
+      {
+        name: "listComposeWindows", group: "messages", crud: "read", title: "List Open Drafts",
+        description: "List accessible open compose windows with unique composeId, revision, recipients, subject and attachment metadata. Use this before creating another reply to identify existing drafts. Does not read full bodies or save/send.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "getComposeWindow", group: "messages", crud: "read", title: "Read Open Draft",
+        description: "Read an open draft's current fields, attachments, source message URI, saved draft URI and revision. Read before editing to preserve user changes and quoted text. composeId is session-scoped, not a mailbox message ID.",
+        inputSchema: { type: "object", properties: { composeId: { type: "string", description: "ID from listComposeWindows" } }, required: ["composeId"] },
+      },
+      {
+        name: "updateComposeWindow", group: "messages", crud: "update", title: "Update Open Draft",
+        description: "Edit a specific open compose window without sending or saving. Requires its latest revision; rejects intervening changes. Only supplied fields change. body/plainTextBody replaces the ENTIRE body including quotes/signature, so preserve them from getComposeWindow. Cannot change sender, attachments, threading or compose format.",
+        inputSchema: { type: "object", properties: {
+          composeId: { type: "string", description: "ID from listComposeWindows" },
+          expectedRevision: { type: "string", description: "Latest revision from getComposeWindow" },
+          changes: { type: "object", additionalProperties: false, properties: {
+            subject: { type: "string" },
+            to: { type: "array", items: { type: "string" } },
+            cc: { type: "array", items: { type: "string" } },
+            bcc: { type: "array", items: { type: "string" } },
+            body: { type: "string", description: "Entire HTML body, only for an HTML compose window" },
+            plainTextBody: { type: "string", description: "Entire plain-text body, only for a plain-text compose window" },
+          } },
+        }, required: ["composeId", "expectedRevision", "changes"] },
+      },
+      {
+        name: "saveComposeWindow", group: "messages", crud: "update", title: "Save Open Draft",
+        description: "Save an unchanged open compose window to its account's Drafts folder, leaving it open. Requires latest revision. Returns Thunderbird's save result; never sends or queues mail.",
+        inputSchema: { type: "object", properties: {
+          composeId: { type: "string", description: "ID from listComposeWindows" },
+          expectedRevision: { type: "string", description: "Latest revision from getComposeWindow" },
+        }, required: ["composeId", "expectedRevision"] },
       },
       {
         name: "sendMail",
@@ -8706,8 +8744,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return args;
             }
 
+            let composeWindows;
+            function getComposeWindows() {
+              if (!composeWindows) {
+                const nativeCompose = context.extension.apiManager
+                  .getAPI("compose", context.extension, "addon_parent").getAPI(context).compose;
+                const host = createThunderbirdComposeHost({
+                  windows: () => [...Services.wm.getEnumerator("msgcompose")],
+                  accounts: () => [...MailServices.accounts.accounts],
+                  isAccountAllowed,
+                  compose: nativeCompose,
+                  tabId: win => context.extension.tabManager.getWrapper(win).id,
+                  token: () => Services.uuid.generateUUID().toString(),
+                });
+                composeWindows = createComposeWindowWorkflow(host);
+              }
+              return composeWindows;
+            }
+
             async function callTool(name, args) {
               switch (name) {
+                case "listComposeWindows":
+                  return await getComposeWindows().list();
+                case "getComposeWindow":
+                  return await getComposeWindows().get(args.composeId);
+                case "updateComposeWindow":
+                  return await getComposeWindows().update(args.composeId, args.expectedRevision, args.changes);
+                case "saveComposeWindow":
+                  return await getComposeWindows().save(args.composeId, args.expectedRevision);
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":

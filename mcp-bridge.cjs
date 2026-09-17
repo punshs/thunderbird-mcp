@@ -7,7 +7,6 @@
  */
 
 const http = require('http');
-const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -22,106 +21,56 @@ const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
-
-// snap-confine gives each snap a private /tmp inside its mount namespace. The
-// snap sees TMPDIR=/tmp, but that is NOT the host's /tmp -- from outside the
-// namespace the same directory is reachable at
-// /tmp/snap-private-tmp/snap.<instance>/tmp. Reading TMPDIR out of
-// /proc/<pid>/environ therefore yields a path that resolves to the wrong
-// directory for anything running on the host, which is exactly where the
-// bridge runs.
 const SNAP_PRIVATE_TMP_ROOT = '/tmp/snap-private-tmp';
 const DEFAULT_SNAP_INSTANCE = 'thunderbird';
+const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
-const BRIDGE_VERSION = '0.6.3';
-
-/**
- * MCP revisions this bridge can speak, newest first.
- *
- * The bridge only exposes tools and answers lifecycle methods, and that
- * surface is identical across these revisions, so any of them is safe to
- * agree to.
- */
-const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-const FALLBACK_PROTOCOL_VERSION = '2024-11-05';
-
-/**
- * Pick the protocol version to report from initialize.
- *
- * The spec requires the server to echo the client's requested version when it
- * supports it, and only substitute its own when it does not. This previously
- * returned a hardcoded 2024-11-05 no matter what was asked for; a client that
- * requires the version it proposed sees that as a failed handshake and waits
- * until it times out, while the server looks perfectly healthy from outside.
- */
-function negotiateProtocolVersion(requested) {
-  if (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) {
-    return requested;
+// MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
+// server MUST respond with the requested version if it supports it, otherwise
+// with the latest version it supports. The bridge is a transparent JSON-RPC
+// relay -- behavior never changes by version -- so it accepts every published
+// version, but it does NOT echo unknown future versions back as if it knew them.
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-10-07',
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
+const LATEST_PROTOCOL_VERSION = '2025-11-25';
+const BRIDGE_VERSION = (() => {
+  try {
+    return require('./package.json').version || '0.0.0';
+  } catch {
+    return '0.0.0';
   }
-  return FALLBACK_PROTOCOL_VERSION;
+})();
+const SERVER_INFO = Object.freeze({
+  name: 'thunderbird-mcp',
+  version: BRIDGE_VERSION,
+});
+
+const DEBUG = !!process.env.THUNDERBIRD_MCP_DEBUG;
+
+function debugLog(message) {
+  if (DEBUG) {
+    process.stderr.write('[thunderbird-mcp] ' + message + '\n');
+  }
 }
 
-/**
- * Trace the stdio conversation for debugging a stalled handshake.
- *
- * THUNDERBIRD_MCP_DEBUG_FILE appends to a file; THUNDERBIRD_MCP_DEBUG writes
- * to stderr. The file form exists because not every client surfaces a
- * server's stderr -- when a handshake stalls and the client's own log only
- * records what it sent, an absent stderr trace is ambiguous: it cannot
- * distinguish "the bridge never ran" from "the bridge ran and nobody
- * captured it". A file on disk is unambiguous.
- */
-function traceStdio(direction, payload) {
-  const configured = process.env.THUNDERBIRD_MCP_DEBUG_FILE;
-  if (!configured && !process.env.THUNDERBIRD_MCP_DEBUG) {
-    return;
-  }
-
-  let line;
-  try {
-    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    line = `${new Date().toISOString()} [thunderbird-mcp] ${direction} ${text.slice(0, 800)}\n`;
-  } catch {
-    return; // Tracing must never break the bridge.
-  }
-
-  if (process.env.THUNDERBIRD_MCP_DEBUG) {
-    try {
-      process.stderr.write(line);
-    } catch { /* ignore */ }
-  }
-
-  if (!configured) {
-    return;
-  }
-
-  // A client that does not expand ${HOME} and friends hands the literal
-  // string through, and appending to it fails on a directory that cannot
-  // exist. Silently swallowing that is how a trace file goes missing and
-  // looks like "the bridge never ran" -- so fall back to a path that is
-  // always writable, and say so on stderr.
-  const targets = [configured];
-  if (/\$\{|^~|^(?!\/)/.test(configured)) {
-    targets.push(path.join(os.tmpdir(), 'thunderbird-mcp-trace.log'));
-  }
-
-  for (const target of targets) {
-    try {
-      fs.appendFileSync(target, line);
-      return;
-    } catch (err) {
-      try {
-        process.stderr.write(
-          `[thunderbird-mcp] could not write trace to ${target}: ${err.message}\n`
-        );
-      } catch { /* ignore */ }
-    }
-  }
+function isValidAuthToken(token) {
+  return typeof token === 'string' && AUTH_TOKEN_PATTERN.test(token);
 }
 
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
 let lastDiscoveryAttempts = [];
+// Full set of valid connection candidates from the last discovery, in priority
+// order. forwardToThunderbird advances through this list when a candidate's
+// HTTP endpoint refuses or returns 403, so a stale connection file can't
+// permanently mask a live one further down the list.
+let cachedCandidateList = [];
+let cachedCandidateIndex = 0;
 
 function normalizeFsError(err) {
   if (!err) {
@@ -595,6 +544,7 @@ function tryReadConnectionCandidate(candidate, context) {
 function discoverConnectionInfo(options = {}) {
   const groups = buildCandidateGroups(options);
   const attempts = [];
+  const candidates = [];
 
   for (const group of groups) {
     attempts.push(...group.notes);
@@ -603,22 +553,313 @@ function discoverConnectionInfo(options = {}) {
       const result = tryReadConnectionCandidate(candidate, group.context);
       attempts.push(result.attempt);
       if (result.ok) {
-        return { data: result.data, attempts, selectedPath: candidate.path };
-      }
-      if (group.stopOnFailure) {
-        return { data: null, attempts, selectedPath: null };
+        candidates.push({ data: result.data, path: candidate.path });
+        if (group.stopOnFailure) {
+          // Hard pin (e.g. THUNDERBIRD_MCP_CONNECTION_FILE): user explicitly named
+          // this candidate; honor it and don't fall through to autodiscovery.
+          return { candidates, attempts };
+        }
+      } else if (group.stopOnFailure) {
+        // Pinned path failed; do not fall through to autodiscovery candidates.
+        return { candidates, attempts };
       }
     }
   }
 
-  return { data: null, attempts, selectedPath: null };
+  return { candidates, attempts };
+}
+
+// Max raw bytes for an attachment read from a path before base64 encoding.
+// Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
+// extension's 25 MB MAX_BASE64_SIZE limit.
+const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+// Keep these message-wide limits in sync with extension/mcp_server/api.js.
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+
+// File paths that an MCP caller must never be allowed to attach to outbound
+// mail. Keep the pattern list and helper behavior identical to the extension so
+// neither transport can bypass the LLM-confused-deputy defense.
+// Keep in sync with extension/mcp_server/api.js isSensitiveFilePath.
+const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // SSH / PGP / cloud / kube / docker credentials
+  /\/\.ssh(\/|$)/,
+  /\/\.gnupg(\/|$)/,
+  /\/\.aws(\/|$)/,
+  /\/\.azure(\/|$)/,
+  /\/\.config\/gcloud(\/|$)/,
+  /\/\.kube(\/|$)/,
+  /\/\.docker(\/|$)/,
+  /\/\.netrc$/,
+  /\/\.npmrc$/,
+  /\/\.pypirc$/,
+  // Common key / secret file extensions anywhere on disk
+  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
+  /\.pem$/,
+  /\.pfx$/,
+  /\.p12$/,
+  /\.kdbx$/,
+  /\.key$/,
+  /\.asc$/,
+  /\.gpg$/,
+  // Linux / macOS system directories
+  /^\/etc\//,
+  /^\/proc\//,
+  /^\/sys\//,
+  /^\/root\//,
+  /^\/var\/log\//,
+  /^\/var\/lib\/sudo\//,
+  // macOS keychain locations
+  /\/library\/keychains\//,
+  // Windows system directories
+  /^[a-z]:\/windows\//,
+  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
+  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
+  // Browser credential stores (Firefox / Chrome / Edge)
+  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
+  // Thunderbird's own profile (contains the user's entire mail store + prefs).
+  // Linux profile directories and profiles.ini live directly under
+  // ~/.thunderbird (or ~/.icedove), while macOS and Windows use the platform
+  // application-data directories below. Block each profile root in full.
+  /\/\.(?:thunderbird|icedove)(\/|$)/,
+  /\/library\/thunderbird(\/|$)/,
+  /\/appdata\/roaming\/thunderbird(\/|$)/,
+];
+
+function isSensitiveFilePath(attachmentPath) {
+  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
+  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+}
+
+// Tools whose `attachments` array may contain string file paths that this
+// bridge resolves on the host filesystem before forwarding. Needed because the
+// Thunderbird snap (and other sandboxed installs) cannot see arbitrary host
+// paths like /data/... or the host's /tmp; passing those paths through to the
+// extension results in silent "failed to attach" warnings since file.exists()
+// returns false inside the sandbox. Reading on the bridge side and shipping
+// inline base64 sidesteps the sandbox entirely.
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'replyToMessage', 'forwardMessage']);
+
+// Minimal MIME map covering common attachment types (documents, images,
+// archives, A/V). Falls back to application/octet-stream which Thunderbird
+// handles fine.
+const MIME_BY_EXT = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  heic: 'image/heic',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  html: 'text/html',
+  htm: 'text/html',
+  md: 'text/markdown',
+  json: 'application/json',
+  xml: 'application/xml',
+  yml: 'application/yaml',
+  yaml: 'application/yaml',
+  zip: 'application/zip',
+  tar: 'application/x-tar',
+  gz: 'application/gzip',
+  '7z': 'application/x-7z-compressed',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  odp: 'application/vnd.oasis.opendocument.presentation',
+  ics: 'text/calendar',
+  eml: 'message/rfc822',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime'
+};
+
+function guessContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase().replace(/^\./, '');
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+function attachmentError(action, filePath, error) {
+  if (error?.code === 'ENOENT') {
+    return new Error(`Attachment not found: ${filePath}`, { cause: error });
+  }
+  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+    return new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: error });
+  }
+  return new Error(`Attachment ${action} failed (${error?.code || 'unknown'}): ${filePath}`, { cause: error });
+}
+
+function validateAttachmentStat(filePath, stat) {
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+    throw new Error(`Attachment has an invalid file size: ${filePath}`);
+  }
+  if (stat.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `Attachment too large: ${filePath} is ${stat.size} bytes ` +
+      `(limit ${MAX_ATTACHMENT_BYTES} bytes / ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB raw before base64)`
+    );
+  }
+}
+
+async function inspectAttachmentPath(filePath) {
+  // Check both the supplied path and its lexical normalization before any
+  // filesystem access. The latter catches paths such as /tmp/../etc/passwd.
+  if (isSensitiveFilePath(filePath) || isSensitiveFilePath(path.resolve(filePath))) {
+    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
+  }
+
+  let stat;
+  try {
+    // lstat is deliberate: stat would follow the final symlink before policy
+    // could reject it.
+    stat = await fs.promises.lstat(filePath);
+  } catch (e) {
+    throw attachmentError('lstat', filePath, e);
+  }
+  validateAttachmentStat(filePath, stat);
+  return { filePath, stat };
+}
+
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readFileHandleExactly(handle, filePath, size) {
+  const buffer = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+    if (bytesRead === 0) {
+      throw new Error(`Attachment changed while being read: ${filePath}`);
+    }
+    offset += bytesRead;
+  }
+
+  // Do not let a file that grew after fstat trigger an unbounded read.
+  const extra = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(extra, 0, 1, size);
+  if (bytesRead !== 0) {
+    throw new Error(`Attachment changed while being read: ${filePath}`);
+  }
+
+  return buffer;
+}
+
+// Read a preflighted file path off the host filesystem and convert it to the
+// inline { name, contentType, base64 } shape the extension supports. Opening
+// with O_NOFOLLOW where available and comparing the opened file to the lstat
+// snapshot prevents a path swap from redirecting the read to a symlink/other
+// inode between policy validation and I/O.
+async function readAttachmentFromPath(fileInfo) {
+  const { filePath, stat: preflightStat } = fileInfo;
+  const freshInfo = await inspectAttachmentPath(filePath);
+  if (!sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
+    throw new Error(`Attachment changed after validation: ${filePath}`);
+  }
+
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  let handle;
+  try {
+    handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
+  } catch (e) {
+    if (e?.code === 'ELOOP') {
+      throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`, { cause: e });
+    }
+    throw attachmentError('open', filePath, e);
+  }
+
+  try {
+    let openedStat;
+    try {
+      openedStat = await handle.stat();
+    } catch (e) {
+      throw attachmentError('fstat', filePath, e);
+    }
+    validateAttachmentStat(filePath, openedStat);
+    if (!sameFile(freshInfo.stat, openedStat) || freshInfo.stat.size !== openedStat.size) {
+      throw new Error(`Attachment changed after validation: ${filePath}`);
+    }
+    const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
+    return {
+      name: path.basename(filePath),
+      contentType: guessContentType(filePath),
+      base64: buffer.toString('base64')
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+// Replace every string entry in `args.attachments` (= file path) with an
+// inline { name, contentType, base64 } object read off the host filesystem.
+// Inline objects pass through unchanged. All paths and message-wide limits are
+// preflighted before the first read, then files are read sequentially so a
+// caller cannot force many large buffers to be resident at once.
+async function inlineAttachmentPaths(args) {
+  if (!args || !Array.isArray(args.attachments)) return;
+
+  if (args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    throw new Error(
+      `Attachment count ${args.attachments.length} exceeds the ` +
+      `${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
+    );
+  }
+
+  const fileInfoByIndex = new Map();
+  let totalAttachmentBytes = 0;
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    if (typeof entry !== 'string') continue;
+
+    const fileInfo = await inspectAttachmentPath(entry);
+    if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+      throw new Error(
+        `Attachment aggregate too large at ${entry}: exceeds the ` +
+        `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
+      );
+    }
+    totalAttachmentBytes += fileInfo.stat.size;
+    fileInfoByIndex.set(index, fileInfo);
+  }
+
+  const resolved = [];
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    resolved.push(
+      typeof entry === 'string'
+        ? await readAttachmentFromPath(fileInfoByIndex.get(index))
+        : entry
+    );
+  }
+  args.attachments = resolved;
 }
 
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if no valid candidate exists.
- * Caches the result for a short TTL to avoid hitting the filesystem on every request.
- * Cache is cleared on connection errors (see clearConnectionCache).
+ * Caches the full candidate list for a short TTL so forwardToThunderbird can
+ * advance past a stale winner on connection failure without re-running discovery.
  */
 function readConnectionInfo(options = {}) {
   if (cachedConnectionInfo && Date.now() < connectionCacheExpiry) {
@@ -627,19 +868,41 @@ function readConnectionInfo(options = {}) {
 
   const result = discoverConnectionInfo(options);
   lastDiscoveryAttempts = result.attempts;
+  cachedCandidateList = result.candidates;
+  cachedCandidateIndex = 0;
 
-  if (!result.data) {
+  if (!cachedCandidateList.length) {
     return null;
   }
 
-  cachedConnectionInfo = result.data;
+  cachedConnectionInfo = cachedCandidateList[0].data;
   connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
-  return result.data;
+  return cachedConnectionInfo;
+}
+
+/**
+ * Advance to the next cached connection candidate after the current one fails
+ * to reach Thunderbird. Returns the new candidate's data, or null when the
+ * cached list is exhausted (caller should rediscover from scratch).
+ */
+function advanceToNextCandidate() {
+  if (!cachedCandidateList.length) {
+    return null;
+  }
+  cachedCandidateIndex += 1;
+  if (cachedCandidateIndex >= cachedCandidateList.length) {
+    return null;
+  }
+  cachedConnectionInfo = cachedCandidateList[cachedCandidateIndex].data;
+  connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
+  return cachedConnectionInfo;
 }
 
 function clearConnectionCache() {
   cachedConnectionInfo = null;
   connectionCacheExpiry = 0;
+  cachedCandidateList = [];
+  cachedCandidateIndex = 0;
 }
 
 function formatDiscoveryAttempts(attempts = lastDiscoveryAttempts) {
@@ -662,7 +925,10 @@ function buildConnectionDiscoveryErrorMessage() {
 }
 
 function sanitizeJson(data) {
-  // Remove control chars except \n, \r, \t
+  // Remove control chars except \n, \r, \t. The character class is
+  // intentional -- some clients emit stray control bytes and we
+  // sanitize them out before JSON.parse() chokes on them.
+  // eslint-disable-next-line no-control-regex
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Escape raw newlines/carriage returns/tabs that aren't already escaped.
   // Match an even number of backslashes (including zero) before the control
@@ -688,22 +954,56 @@ async function handleMessage(line) {
   // Handle MCP lifecycle methods locally so the bridge can complete
   // handshake even when Thunderbird isn't running yet.
   switch (message.method) {
-    case 'initialize':
+    case 'initialize': {
+      const requested = message.params?.protocolVersion;
+      if (typeof requested !== 'string') {
+        return {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: -32602,
+            message: 'Invalid params: protocolVersion must be a string',
+          },
+        };
+      }
+      const negotiated = SUPPORTED_PROTOCOL_VERSIONS.has(requested)
+        ? requested
+        : LATEST_PROTOCOL_VERSION;
       return {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: negotiateProtocolVersion(message.params?.protocolVersion),
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
-          serverInfo: { name: 'thunderbird-mcp', version: BRIDGE_VERSION }
-        }
+          serverInfo: SERVER_INFO,
+        },
       };
+    }
     case 'ping':
       return { jsonrpc: '2.0', id: message.id, result: {} };
     case 'resources/list':
       return { jsonrpc: '2.0', id: message.id, result: { resources: [] } };
     case 'prompts/list':
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
+  }
+
+  // For mail-sending tools, inline any attachments passed as file paths.
+  // The Thunderbird extension may run inside a sandboxed snap that cannot
+  // see /data/..., the host /tmp, or any path outside its confined view —
+  // letting paths through results in silent "failed to attach" warnings.
+  // Reading on the bridge side and shipping base64 sidesteps the sandbox.
+  if (message.method === 'tools/call'
+      && message.params
+      && ATTACHMENT_TOOLS.has(message.params.name)) {
+    try {
+      await inlineAttachmentPaths(message.params.arguments);
+    } catch (e) {
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: e.message }
+      };
+    }
   }
 
   return forwardToThunderbird(message);
@@ -729,8 +1029,9 @@ function tryRequest(hostname, postData, port, token) {
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
         if (res.statusCode === 403) {
-          clearConnectionCache();
-          reject(new Error('Authentication failed (403). Token may be stale — retrying with fresh connection info.'));
+          const err = new Error('Authentication failed (403). Token may be stale.');
+          err.statusCode = 403;
+          reject(err);
           return;
         }
         const data = Buffer.concat(chunks).toString('utf8');
@@ -758,13 +1059,63 @@ function tryRequest(hostname, postData, port, token) {
   });
 }
 
-async function forwardToThunderbird(message, _retried) {
+function isRetryableConnectionError(err) {
+  return err
+    && (err.statusCode === 403
+      || err.code === 'ECONNREFUSED'
+      || err.code === 'EADDRNOTAVAIL'
+      || err.code === 'EAFNOSUPPORT');
+}
+
+function tryAllHosts(hosts, postData, port, token) {
+  const tryNext = ([hostname, ...rest]) => {
+    return tryRequest(hostname, postData, port, token).catch((err) => {
+      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
+        return tryNext(rest);
+      }
+      throw err;
+    });
+  };
+  return tryNext(hosts);
+}
+
+function compactToolResultJsonText(response) {
+  const content = response?.result?.content;
+  if (!Array.isArray(content)) {
+    return response;
+  }
+
+  let changed = false;
+  const compactedContent = content.map((item) => {
+    if (item?.type !== 'text' || typeof item.text !== 'string') {
+      return item;
+    }
+    try {
+      const compactedText = JSON.stringify(JSON.parse(item.text));
+      if (compactedText === item.text) {
+        return item;
+      }
+      changed = true;
+      return { ...item, text: compactedText };
+    } catch {
+      // Non-JSON text content is already the compact representation.
+      return item;
+    }
+  });
+
+  if (!changed) {
+    return response;
+  }
+  return { ...response, result: { ...response.result, content: compactedContent } };
+}
+
+async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
-  // Fail-closed: if the connection file is missing, retry a few times
-  // (Thunderbird may still be starting), then fail with an error.
-  // Never forward requests without authentication.
+  // Fail-closed: if no connection file exists, retry a few times (Thunderbird may
+  // still be starting), then fail with an error. Never forward requests without
+  // authentication.
   let connInfo = readConnectionInfo();
   if (!connInfo) {
     for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
@@ -779,74 +1130,59 @@ async function forwardToThunderbird(message, _retried) {
     }
   }
 
-  if (!connInfo.port || !connInfo.token) {
-    throw new Error('Invalid connection file: missing port or token');
-  }
-  if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
-    throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
-  }
+  // Walk through the cached candidate list on retryable failures so a stale
+  // connection.json can't permanently mask a live one further down the list.
+  // After the cached list is exhausted, rediscover once before giving up.
+  let rediscoveryAttempted = false;
 
-  const { port, token } = connInfo;
+  while (connInfo) {
+    if (!connInfo.port || !connInfo.token) {
+      throw new Error('Invalid connection file: missing port or token');
+    }
+    if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
+      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
+    }
+    if (!isValidAuthToken(connInfo.token)) {
+      throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
+    }
 
-  // Try each host in order - handles platforms where 'localhost' resolves to
-  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
-  const tryNext = (hosts) => {
-    const [hostname, ...rest] = hosts;
-    return tryRequest(hostname, postData, port, token).catch((err) => {
-      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
-        return tryNext(rest);
+    try {
+      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
+    } catch (err) {
+      if (!isRetryableConnectionError(err)) {
+        throw err;
       }
-      // On 403 or connection refused, clear cache and retry once with fresh
-      // connection info (Thunderbird may have restarted on a new port/token).
-      if (!_retried) {
-        if (err.message && err.message.includes('403')) {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
+
+      const next = advanceToNextCandidate();
+      if (next) {
+        connInfo = next;
+        continue;
+      }
+
+      if (!rediscoveryAttempted) {
+        rediscoveryAttempted = true;
+        clearConnectionCache();
+        connInfo = readConnectionInfo();
+        if (!connInfo) {
+          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
         }
-        if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
-        }
+        continue;
       }
-      // Already retried or non-recoverable error
-      if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
-        throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
-      }
-      throw err;
-    });
-  };
 
-  return tryNext(THUNDERBIRD_HOSTS);
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
+    }
+  }
 }
 
 function startBridge() {
-  // Recorded before anything else so the trace distinguishes "never started"
-  // from "started and then went quiet", and identifies which runtime and
-  // which copy of this file the client actually launched.
-  traceStdio('boot   ', {
-    version: BRIDGE_VERSION,
-    node: process.version,
-    execPath: process.execPath,
-    script: __filename,
-    pid: process.pid,
-    connectionFileEnv: process.env.THUNDERBIRD_MCP_CONNECTION_FILE || null,
-  });
-
-  // Ensure stdout doesn't buffer - critical for MCP protocol
-  if (process.stdout._handle?.setBlocking) {
-    process.stdout._handle.setBlocking(true);
-  }
-
-  process.on('uncaughtException', (err) => {
-    traceStdio('FATAL  ', { message: err.message, stack: err.stack });
-    process.exit(1);
-  });
-
   let pendingRequests = 0;
   let stdinClosed = false;
 
+  debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
+
   function checkExit() {
     if (stdinClosed && pendingRequests === 0) {
+      debugLog('shutdown stdin-closed and no pending requests, exiting 0');
       process.exit(0);
     }
   }
@@ -861,49 +1197,68 @@ function startBridge() {
     });
   }
 
-  // Process stdin as JSON-RPC messages
-  const rl = readline.createInterface({ input: process.stdin, terminal: false });
-
-  rl.on('line', (line) => {
+  function dispatch(line) {
     if (!line.trim()) {
       return;
     }
 
     let messageId = null;
+    let messageMethod = null;
     try {
-      messageId = JSON.parse(line).id ?? null;
+      const parsed = JSON.parse(line);
+      messageId = parsed.id ?? null;
+      messageMethod = parsed.method ?? null;
     } catch {
       // Leave as null when request cannot be parsed
     }
 
-    traceStdio('<-- in ', line);
+    debugLog(`recv method=${messageMethod} id=${messageId}`);
 
     pendingRequests++;
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
-          traceStdio('--> out', response);
-          await writeOutput(JSON.stringify(response) + '\n');
-        } else {
-          traceStdio('--- notification, no reply', line);
+          await writeOutput(JSON.stringify(compactToolResultJsonText(response)) + '\n');
+          debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
       .catch(async (err) => {
-        const failure = {
+        debugLog(`error id=${messageId} method=${messageMethod} message=${err.message}`);
+        await writeOutput(JSON.stringify({
           jsonrpc: '2.0',
           id: messageId,
           error: { code: -32700, message: `Bridge error: ${err.message}` }
-        };
-        traceStdio('--> err', failure);
-        await writeOutput(JSON.stringify(failure) + '\n');
+        }) + '\n');
       })
       .finally(() => {
         pendingRequests--;
         checkExit();
       });
-  });
+  }
 
-  rl.on('close', () => {
+  // Manual newline-delimited JSON parsing on raw stdin. The previous
+  // readline-based implementation lost the initialize response under
+  // Claude Desktop's Electron-spawned Node on Windows -- writes from
+  // promise callbacks never made it back through the pipe. Reading raw
+  // 'data' events with explicit utf8 encoding matches what the official
+  // @modelcontextprotocol/sdk stdio transport does and works reliably.
+  process.stdin.setEncoding('utf8');
+  let buffer = '';
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      dispatch(line);
+    }
+  });
+  process.stdin.on('end', () => {
+    if (buffer.length > 0) {
+      const tail = buffer.replace(/\r$/, '');
+      buffer = '';
+      dispatch(tail);
+    }
     stdinClosed = true;
     checkExit();
   });
@@ -917,6 +1272,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  advanceToNextCandidate,
   buildCandidateGroups,
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
@@ -926,6 +1282,15 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  compactToolResultJsonText,
+  inlineAttachmentPaths,
+  isSensitiveFilePath,
+  isValidAuthToken,
   readConnectionInfo,
   startBridge,
+  attachmentLimits: {
+    MAX_ATTACHMENT_BYTES,
+    MAX_TOTAL_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_PER_MESSAGE,
+  },
 };

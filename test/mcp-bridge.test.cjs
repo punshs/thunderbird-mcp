@@ -5,8 +5,15 @@ const os = require('os');
 const path = require('path');
 
 const {
+  advanceToNextCandidate,
+  attachmentLimits,
   buildConnectionDiscoveryErrorMessage,
+  compactToolResultJsonText,
   clearConnectionCache,
+  discoverConnectionInfo,
+  inlineAttachmentPaths,
+  isSensitiveFilePath,
+  isValidAuthToken,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -80,6 +87,199 @@ function makeFsWithStatOverrides(overrides) {
     }
   });
 }
+
+describe('Auth token validation', () => {
+  it('accepts 64 lowercase hex characters', () => {
+    assert.equal(isValidAuthToken('a'.repeat(64)), true);
+    assert.equal(isValidAuthToken('0123456789abcdef'.repeat(4)), true);
+  });
+
+  it('rejects non-generated token shapes', () => {
+    assert.equal(isValidAuthToken(''), false);
+    assert.equal(isValidAuthToken(' '.repeat(64)), false);
+    assert.equal(isValidAuthToken('a'.repeat(63)), false);
+    assert.equal(isValidAuthToken('a'.repeat(65)), false);
+    assert.equal(isValidAuthToken('A'.repeat(64)), false);
+    assert.equal(isValidAuthToken('g'.repeat(64)), false);
+    assert.equal(isValidAuthToken(`${'a'.repeat(64)}\n`), false);
+    assert.equal(isValidAuthToken(null), false);
+  });
+});
+
+describe('Tool result serialization', () => {
+  it('compacts JSON text content without mutating the original response', () => {
+    const originalText = JSON.stringify([{ name: 'INBOX', unreadMessages: 3 }], null, 2);
+    const response = {
+      jsonrpc: '2.0',
+      id: 2,
+      result: {
+        content: [{
+          type: 'text',
+          text: originalText,
+        }],
+      },
+    };
+
+    const compacted = compactToolResultJsonText(response);
+
+    assert.notStrictEqual(compacted, response);
+    assert.deepStrictEqual(
+      JSON.parse(compacted.result.content[0].text),
+      JSON.parse(originalText)
+    );
+    assert.equal(response.result.content[0].text, originalText);
+    assert.equal(compacted.result.content[0].text.includes('\n'), false);
+  });
+
+  it('preserves image content blocks while compacting the leading JSON text', () => {
+    const imageBlock = {
+      type: 'image',
+      data: 'iVBORw0KGgo=',
+      mimeType: 'image/png',
+    };
+    const response = {
+      jsonrpc: '2.0',
+      id: 137,
+      result: {
+        content: [
+          { type: 'text', text: JSON.stringify({ inlineImages: 1 }, null, 2) },
+          imageBlock,
+        ],
+      },
+    };
+
+    const compacted = compactToolResultJsonText(response);
+
+    assert.equal(compacted.result.content[0].text, '{"inlineImages":1}');
+    assert.strictEqual(compacted.result.content[1], imageBlock);
+    assert.strictEqual(response.result.content[1], imageBlock);
+  });
+});
+
+describe('Bridge attachment path policy', () => {
+  let root;
+
+  beforeEach(() => {
+    root = makeTempRoot();
+  });
+
+  afterEach(() => {
+    cleanupTempRoot(root);
+  });
+
+  it('rejects sensitive paths before trying to inline them', async () => {
+    const sensitivePath = path.join(root, '.ssh', 'id_rsa');
+    const args = { attachments: [sensitivePath] };
+
+    await assert.rejects(
+      inlineAttachmentPaths(args),
+      error => {
+        assert.match(error.message, /Sensitive attachment path blocked/);
+        assert.ok(error.message.includes(sensitivePath), error.message);
+        return true;
+      }
+    );
+    assert.deepEqual(args.attachments, [sensitivePath]);
+  });
+
+  it('uses the same normalized deny-list rules for Windows paths', () => {
+    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\.ssh\\id_ed25519'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\Downloads\\report.pdf'), false);
+  });
+
+  it('rejects attachment counts above the extension limit before filesystem access', async () => {
+    const attachments = Array.from(
+      { length: attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE + 1 },
+      (_, index) => ({ name: `inline-${index}.txt`, base64: 'QQ==' })
+    );
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments }),
+      new RegExp(
+        `Attachment count ${attachments.length} exceeds the ` +
+        `${attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
+      )
+    );
+  });
+
+  it('rejects an aggregate of path attachments above 50 MB before reading', async () => {
+    const sizes = [18, 18, 15].map(mib => mib * 1024 * 1024);
+    const attachments = sizes.map((size, index) => {
+      const filePath = path.join(root, `aggregate-${index}.bin`);
+      fs.writeFileSync(filePath, '');
+      fs.truncateSync(filePath, size);
+      return filePath;
+    });
+    const args = { attachments };
+
+    await assert.rejects(
+      inlineAttachmentPaths(args),
+      error => {
+        assert.match(error.message, /50 MB aggregate attachment limit/);
+        assert.ok(error.message.includes(attachments[2]), error.message);
+        return true;
+      }
+    );
+    assert.deepEqual(args.attachments, attachments);
+  });
+
+  it('rejects oversized and non-regular files during preflight', async () => {
+    const oversizedPath = path.join(root, 'oversized.bin');
+    fs.writeFileSync(oversizedPath, '');
+    fs.truncateSync(oversizedPath, attachmentLimits.MAX_ATTACHMENT_BYTES + 1);
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [oversizedPath] }),
+      error => error.message.includes(`Attachment too large: ${oversizedPath}`)
+    );
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [root] }),
+      error => error.message.includes(`Attachment is not a regular file: ${root}`)
+    );
+  });
+
+  it('rejects symlinked attachment paths', async (t) => {
+    const targetPath = path.join(root, 'target.txt');
+    const symlinkPath = path.join(root, 'attachment.txt');
+    fs.writeFileSync(targetPath, 'safe attachment', 'utf8');
+    try {
+      fs.symlinkSync(targetPath, symlinkPath, 'file');
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') {
+        t.skip(`symlinks unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [symlinkPath] }),
+      error => {
+        assert.match(error.message, /symlink/);
+        assert.ok(error.message.includes(symlinkPath), error.message);
+        return true;
+      }
+    );
+  });
+
+  it('inlines allowed files and leaves inline objects untouched', async () => {
+    const filePath = path.join(root, 'report.txt');
+    const inline = { name: 'already-inline.txt', base64: 'QQ==' };
+    fs.writeFileSync(filePath, 'hello', 'utf8');
+    const args = { attachments: [filePath, inline] };
+
+    await inlineAttachmentPaths(args);
+
+    assert.deepEqual(args.attachments, [
+      {
+        name: 'report.txt',
+        contentType: 'text/plain',
+        base64: Buffer.from('hello').toString('base64'),
+      },
+      inline,
+    ]);
+  });
+});
 
 describe('Bridge discovery', () => {
   let root;
@@ -206,7 +406,11 @@ describe('Bridge discovery', () => {
   });
 
   it('macOS scan finds current uid files and ignores other owners', () => {
-    const currentUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+    // Pin a synthetic uid rather than process.getuid(). On Windows the real
+    // fs.statSync reports uid=0 for every file regardless of the caller, so we
+    // can't rely on stat.uid matching process.getuid() — both files are stat-
+    // overridden below so the uid-filter logic is exercised on any platform.
+    const currentUid = 1000;
     const darwinRoot = path.join(root, 'var', 'folders');
     const options = makeTestOptions(root, {
       platform: 'darwin',
@@ -227,6 +431,10 @@ describe('Bridge discovery', () => {
     });
 
     const statOverrides = new Map();
+    // Force both stat results: the owned file to the caller's uid and the
+    // foreign one to a different uid, so the filter is tested independent of
+    // what the host's real fs.statSync returns.
+    statOverrides.set(ownedConnFile, { uid: currentUid });
     statOverrides.set(foreignConnFile, { uid: currentUid + 1 });
 
     const connInfo = readConnectionInfo({
@@ -272,5 +480,81 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+  });
+
+  it('discoverConnectionInfo collects every valid candidate, not just the winner', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+    });
+
+    // Native /tmp file (first group, winner)
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20100,
+      token: 'native',
+    });
+
+    // Flatpak runtime file (later group, also valid)
+    writeConnectionFile(
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      { port: 20101, token: 'flatpak' }
+    );
+
+    const result = discoverConnectionInfo(options);
+    assert.ok(result.candidates.length >= 2, `expected >=2 candidates, got ${result.candidates.length}`);
+    assert.equal(result.candidates[0].data.token, 'native');
+    assert.ok(result.candidates.some(c => c.data.token === 'flatpak'));
+  });
+
+  it('advanceToNextCandidate walks the cached list, then returns null when exhausted', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+    });
+
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20200,
+      token: 'first',
+    });
+    writeConnectionFile(
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      { port: 20201, token: 'second' }
+    );
+
+    const first = readConnectionInfo(options);
+    assert.equal(first.token, 'first');
+
+    const second = advanceToNextCandidate();
+    assert.ok(second, 'should advance to a second candidate');
+    assert.equal(second.token, 'second');
+
+    const third = advanceToNextCandidate();
+    assert.equal(third, null, 'should return null after the last candidate');
+  });
+
+  it('advanceToNextCandidate returns null when no cache exists', () => {
+    clearConnectionCache();
+    assert.equal(advanceToNextCandidate(), null);
+  });
+
+  it('hard-pinned env override does not collect autodiscovery candidates as fallbacks', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      runtimeDir: path.join(root, 'runtime'),
+      env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'pinned', 'connection.json') },
+    });
+
+    writeConnectionFile(options.env.THUNDERBIRD_MCP_CONNECTION_FILE, {
+      port: 20300,
+      token: 'pinned',
+    });
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+      port: 20301,
+      token: 'should-not-appear',
+    });
+
+    const result = discoverConnectionInfo(options);
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].data.token, 'pinned');
   });
 });

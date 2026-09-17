@@ -81,6 +81,7 @@ describe('Tagging: validation edge cases', () => {
           query: { type: "string" },
           tag: { type: "string" },
           maxResults: { type: "number" },
+          dedupByMessageId: { type: "boolean" },
         },
         required: ["query"],
       },
@@ -342,9 +343,15 @@ describe('Contact write: validation edge cases', () => {
           displayName: { type: "string" },
           firstName: { type: "string" },
           lastName: { type: "string" },
+          phones: { type: "array" },
+          addresses: { type: "array" },
+          organization: { type: "string" },
+          title: { type: "string" },
+          note: { type: "string" },
+          birthday: { type: "string" },
           addressBookId: { type: "string" },
         },
-        required: ["email"],
+        required: [],
       },
     },
     {
@@ -357,6 +364,12 @@ describe('Contact write: validation edge cases', () => {
           displayName: { type: "string" },
           firstName: { type: "string" },
           lastName: { type: "string" },
+          phones: { type: "array" },
+          addresses: { type: "array" },
+          organization: { type: "string" },
+          title: { type: "string" },
+          note: { type: "string" },
+          birthday: { type: "string" },
         },
         required: ["contactId"],
       },
@@ -374,9 +387,9 @@ describe('Contact write: validation edge cases', () => {
   ];
   const contactValidate = createValidator(contactTools);
 
-  it('rejects createContact with null email', () => {
+  it('allows omitted contact fields at the schema layer', () => {
     const errors = contactValidate('createContact', { email: null });
-    assert.ok(errors.some(e => e.includes('email')));
+    assert.equal(errors.length, 0);
   });
 
   it('rejects createContact with array email', () => {
@@ -419,6 +432,12 @@ describe('Contact write: validation edge cases', () => {
       displayName: 'Test',
       firstName: 'First',
       lastName: 'Last',
+      phones: [{ type: 'mobile', number: '555-0100' }],
+      addresses: [{ type: 'home', city: 'Warsaw' }],
+      organization: 'Example Corp',
+      title: 'Engineer',
+      note: 'note',
+      birthday: '--04-15',
       addressBookId: 'book-1',
     });
     assert.equal(errors.length, 0);
@@ -1073,6 +1092,7 @@ describe('Validation: adversarial and edge-case inputs', () => {
         query: { type: "string" }, folderPath: { type: "string" },
         maxResults: { type: "number" }, offset: { type: "number" },
         unreadOnly: { type: "boolean" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
     }},
@@ -1081,6 +1101,7 @@ describe('Validation: adversarial and edge-case inputs', () => {
       properties: {
         messageId: { type: "string" }, folderPath: { type: "string" },
         saveAttachments: { type: "boolean" },
+        includeInlineImages: { type: "boolean" },
       },
       required: ["messageId", "folderPath"],
     }},
@@ -1209,6 +1230,7 @@ describe('Coercion: string-to-type conversion', () => {
         maxResults: { type: "number" },
         offset: { type: "number" },
         unreadOnly: { type: "boolean" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
     },
@@ -1233,6 +1255,12 @@ describe('Coercion: string-to-type conversion', () => {
     const args = { query: 'test', unreadOnly: 'false' };
     coerceToolArgs('searchMessages', args, schemas);
     assert.strictEqual(args.unreadOnly, false);
+  });
+
+  it('coerces dedupByMessageId "false" string to boolean false', () => {
+    const args = { query: 'test', dedupByMessageId: 'false' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.dedupByMessageId, false);
   });
 
   it('leaves non-boolean strings unchanged for boolean fields', () => {

@@ -1,6 +1,12 @@
-# Thunderbird MCP
+# Thunderbird MCP — punshs fork
 
-[![Tools](https://img.shields.io/badge/39_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+Public fork of [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp), retaining the upstream MIT license and attribution. This branch integrates upstream v0.7.5 with cross-folder conversations, explicit completed folder refresh, folder-local threads, Snap discovery fixes, and Outlook-style HTML replies. Plain-text composition follows upstream format settings. Upstream automatic add-on updates are disabled so they cannot replace the fork; install fork builds manually.
+
+The bridge uses upstream protocol negotiation and metadata-only debug logging. Earlier experimental full-payload trace logging is superseded to avoid logging message content. The proposed open-draft editing and duplicate-prevention tools are not yet implemented.
+
+
+[![CI](https://github.com/punshs/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/punshs/thunderbird-mcp/actions/workflows/ci.yml)
+[![Tools](https://img.shields.io/badge/43_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -17,9 +23,9 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 39 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 43 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Compose tools open a review window before sending by default. Set `skipReview` to send directly when you've already approved the content upstream. **Nothing gets sent without your approval.**
+Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
 
 ---
 
@@ -44,10 +50,11 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
 | `refreshFolders` | Explicitly synchronize selected remote folders and wait for bounded completion. Each folder reports `refreshed`, `skipped`, `timed_out`, or `failed`; partial failures remain visible. By default, refreshes Inbox and Sent folders for accessible accounts. |
-| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
-| `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Includes inline CID images. |
 | `getThread` | List every message in a conversation, oldest first, from either a `messageId` or a `threadId`. Headers plus preview only -- call `getMessage` for bodies. Uses Thunderbird's own threading, so results are folder-local. |
 | `getConversation` | List exact header-linked messages across folders in the seed account, including Sent replies. Uses message IDs and compatible Outlook thread headers, never subject equality alone. Headers only -- call `getMessage` for bodies. |
+| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. By default, `dedupByMessageId` collapses the same RFC Message-ID found in multiple folders/labels into one row and reports the other folder paths in `dupLocations`; set `dedupByMessageId: false` to return every location. |
+| `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
+| `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
@@ -59,17 +66,15 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
 
-For reliable Inbox/Sent triage, use `refreshFolders` (Inbox + Sent) -> `getConversation` -> `getMessage` as needed. Refresh is intentionally explicit: reads do not automatically synchronize every folder before every request, which avoids unnecessary network traffic and latency.
-
 ### Compose
 
 | Tool | Description |
 |------|-------------|
-| `sendMail` | Compose a new email -- opens a review window, or set `skipReview` to send directly |
-| `replyToMessage` | Reply with quoted original and proper threading -- supports `skipReview` |
-| `forwardMessage` | Forward with all original attachments preserved -- supports `skipReview` |
+| `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
+| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
+| `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
-All compose tools open a window for you to review and edit before sending by default. Set `skipReview: true` to send directly when you've already approved the content. Attachments can be file paths or inline base64 objects.
+All compose tools open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
 
 Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
 
@@ -90,9 +95,10 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 | Tool | Description |
 |------|-------------|
-| `searchContacts` | Search contacts across all address books by email or name. Supports `maxResults`. |
-| `createContact` | Create a new contact in any writable address book |
-| `updateContact` | Update an existing contact's email, name, or display name |
+| `searchContacts` | Search contacts across all address books by email or name and return full contact details. Supports `maxResults`. |
+| `getContact` | Read full contact details by UID |
+| `createContact` | Create a contact with optional email/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
+| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty phone/address arrays clear those collections |
 | `deleteContact` | Delete a contact by UID |
 
 ### Calendar
@@ -100,11 +106,11 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with read-only, event, and task support flags |
-| `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
+| `createEvent` | Create a calendar event -- opens a review dialog; direct creation via `skipReview` requires explicitly disabling the default safety block. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
 | `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
 | `updateEvent` | Modify an event's title, dates, location, description, or `status` |
 | `deleteEvent` | Delete a calendar event by ID |
-| `createTask` | Open a pre-filled task dialog for review |
+| `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
 
@@ -116,7 +122,7 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
-The same settings page has a "Send Safety" section: toggle **Block `skipReview`** to reject `sendMail` / `replyToMessage` / `forwardMessage` calls that pass `skipReview: true`. The review-window path still works, so clients stay usable -- they just can't send silently.
+The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
 
 ---
 
@@ -125,10 +131,12 @@ The same settings page has a "Send Safety" section: toggle **Block `skipReview`*
 ### 1. Install the extension
 
 ```bash
-git clone https://github.com/TKasperczyk/thunderbird-mcp.git
+git clone https://github.com/punshs/thunderbird-mcp.git
 ```
 
 Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo -- no build step needed.
+
+**Fork updates:** Install builds from this repository manually. The upstream automatic-update URL is intentionally absent, so an upstream release cannot replace this customized fork.
 
 ### 2. Configure your MCP client
 
@@ -183,7 +191,8 @@ That's it. Your AI can now access Thunderbird.
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
 - **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
-- **Localhost only**: No remote access. The bridge fails closed -- refuses to forward requests without a valid token.
+- **Localhost only**: By default, the server binds to localhost only. The "Listen on all interfaces" option in settings binds to all IPv4 interfaces for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable on trusted networks. Auth token is always required.
+- **Auto-update integrity**: Auto-update is a code-delivery channel whose integrity depends on continued control of the GitHub repository, the GitHub Actions token, and the `tomaszkasperczyk.name` registration.
 
 ---
 
@@ -194,7 +203,7 @@ That's it. Your AI can now access Thunderbird.
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
-| Missing recent emails | Call `refreshFolders` for Inbox and Sent, then inspect its per-folder completion statuses before reading. For a persistent local database problem, right-click the folder > Properties > Repair Folder. |
+| Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
 | `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
@@ -222,7 +231,7 @@ curl -X POST http://127.0.0.1:$PORT \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-After changing extension code: remove from Thunderbird, restart, reinstall the XPI, restart again. Thunderbird caches aggressively.
+**Dev-only extension reload:** After changing extension source locally, remove the add-on from Thunderbird, restart, reinstall the XPI, and restart again. Thunderbird caches aggressively. Regular users should install v0.7.3 once and let auto-update handle later releases.
 
 ---
 
@@ -239,8 +248,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 39 MCP tools + auth + access control
-│       ├── message_workflows.sys.mjs # Conversation, refresh, and reply-layout workflows
+│       ├── api.js              # All 43 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
@@ -250,7 +258,7 @@ thunderbird-mcp/
 
 ## Known issues
 
-- Remote folder databases can be stale until an explicit `refreshFolders` call completes; timed-out updates may continue in Thunderbird, so later same-account folders are reported as skipped for that call
+- IMAP folder databases can be stale until you click on them in Thunderbird
 - HTML-only emails are converted to plain text (original formatting is lost)
 - Recurring calendar event CRUD operates on the series, not individual occurrences
 - IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after

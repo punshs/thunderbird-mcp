@@ -287,12 +287,16 @@ IsHigherThan   = 7     // Priority comparison
 IsLowerThan    = 8     // Priority comparison
 BeginsWith     = 9
 EndsWith       = 10
-IsInAB         = 11    // Is in address book
-IsntInAB       = 12    // Not in address book
+SoundsLike     = 11    // Phonetic match (LDAP)
+LdapDwim       = 12    // LDAP do-what-I-mean
 IsGreaterThan  = 13    // Size comparison
 IsLessThan     = 14    // Size comparison
-Matches        = 15    // Regex match
-DoesntMatch    = 16    // Regex no match
+NameCompletion = 15    // LDAP name completion
+IsInAB         = 16    // Is in address book
+IsntInAB       = 17    // Not in address book
+IsntEmpty      = 18
+Matches        = 19    // Regex match
+DoesntMatch    = 20    // Regex no match
 ```
 
 ### Filter Actions (nsMsgFilterAction)
@@ -517,8 +521,11 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
   const OP_MAP = {
     contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
     isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-    beginsWith: 9, endsWith: 10, isInAB: 11, isntInAB: 12,
-    isGreaterThan: 13, isLessThan: 14, matches: 15, doesntMatch: 16,
+    beginsWith: 9, endsWith: 10,
+    soundsLike: 11, ldapDwim: 12,
+    isGreaterThan: 13, isLessThan: 14,
+    nameCompletion: 15, isInAB: 16, isntInAB: 17, isntEmpty: 18,
+    matches: 19, doesntMatch: 20,
   };
 
   for (const cond of conditions) {

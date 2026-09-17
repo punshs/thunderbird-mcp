@@ -1,6 +1,6 @@
 # Thunderbird MCP — punshs fork
 
-Public fork of [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp), retaining the upstream MIT license and attribution. This branch integrates upstream v0.7.5 with cross-folder conversations, explicit completed folder refresh, folder-local threads, Snap discovery fixes, and Outlook-style HTML replies. Plain-text composition follows upstream format settings. Upstream automatic add-on updates are disabled so they cannot replace the fork; install fork builds manually.
+Public fork of [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp), retaining the upstream MIT license and attribution. This branch integrates upstream v0.7.5 with cross-folder conversations, explicit completed folder refresh, folder-local threads, Snap discovery fixes, and Outlook-style HTML replies. Plain-text input is escaped into Outlook-style HTML composition, preserving Aptos styling and normal paragraph wrapping. The `isHtml` flag describes input markup, not compose-window mode. Upstream automatic add-on updates are disabled so they cannot replace the fork; install fork builds manually.
 
 The bridge uses upstream protocol negotiation and metadata-only debug logging. Earlier experimental full-payload trace logging is superseded to avoid logging message content. Open-draft editing is available through the four compose-window tools below. Automatic duplicate prevention and persistent send-status tracking remain future work.
 

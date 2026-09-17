@@ -1295,7 +1295,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Email body text" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false). Plain input is escaped; composition retains Outlook-style HTML formatting." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
@@ -1340,7 +1340,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Email body (optional)" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false). Plain input is escaped; composition retains Outlook-style HTML formatting." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             attachments: {
               type: "array",
@@ -1597,7 +1597,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false). Plain input is escaped; composition retains Outlook-style HTML formatting." },
             to: { type: "string", description: "Override recipient email (default: original sender)" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
@@ -1644,7 +1644,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             to: { type: "string", description: "Recipient email address" },
             body: { type: "string", description: "Additional text to prepend (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false). Plain input is escaped; composition retains Outlook-style HTML formatting." },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
@@ -3699,24 +3699,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 `<div style="font-family:${OUTLOOK_BODY_FONT}; font-size:${OUTLOOK_BODY_SIZE}; color:#000000">${escapedBody}</div>`;
             }
 
-            function resolveComposeFormat(identity, isHtml, compType) {
-              const identityUsesHtml = identity?.composeHtml !== false;
-              const useHtml = isHtml === true || (isHtml !== false && identityUsesHtml);
+            function resolveComposeFormat(identity, _isHtml, compType) {
+              // isHtml describes the INPUT, not the editor mode. Plain input is
+              // escaped by formatBodyHtml and receives the same Outlook styling.
+              // Native forwarding uses Default/OppositeOfDefault rather than HTML.
               const isForward = compType === Ci.nsIMsgCompType.ForwardInline
                              || compType === Ci.nsIMsgCompType.ForwardAsAttachment;
-
-              let format;
-              if (isHtml === undefined) {
-                format = Ci.nsIMsgCompFormat.Default;
-              } else if (isForward) {
-                const explicitMatchesPref = (isHtml === true) === identityUsesHtml;
-                format = explicitMatchesPref
+              const format = isForward
+                ? (identity?.composeHtml !== false
                   ? Ci.nsIMsgCompFormat.Default
-                  : Ci.nsIMsgCompFormat.OppositeOfDefault;
-              } else {
-                format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.PlainText;
-              }
-              return { useHtml, format };
+                  : Ci.nsIMsgCompFormat.OppositeOfDefault)
+                : Ci.nsIMsgCompFormat.HTML;
+              return { useHtml: true, format };
             }
 
             /**
@@ -6997,10 +6991,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
 
-                // Match body shape and format to caller intent / identity pref.
-                // When the resolved mode is plain, ship a plain body -- the HTML
-                // envelope would otherwise render as literal text in plain-mode
-                // editors and recipients.
+                // Preserve Outlook-style composition for both plain and HTML input.
                 const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
                 msgComposeParams.format = format;
                 if (useHtml) {

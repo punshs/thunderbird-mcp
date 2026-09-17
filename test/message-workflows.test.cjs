@@ -62,6 +62,7 @@ function createReplyEditor(initialNames, {
   function createNode(name) {
     const node = {
       name,
+      style: {},
       children: [],
       parentNode: null,
       matches(selector) {
@@ -525,6 +526,7 @@ describe("reply editor layout", () => {
 
     assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "signature", "quote"]);
     assert.equal(insertedNode.name, "aptos");
+    assert.equal(originalChildren[0].style.marginBottom, "12pt");
     assert.equal(selection.ranges[0].selectedNode, insertedNode);
     assert.equal(selection.ranges[0].collapsedToStart, false);
     assert.equal(selection.ranges[0].startAfterNode, undefined);
@@ -541,6 +543,7 @@ describe("reply editor layout", () => {
 
     assert.deepStrictEqual(body.children.map(node => node.name), ["aptos", "quote"]);
     assert.equal(body.children[1], originalChildren[0]);
+    assert.equal(body.children[0].style.marginBottom, "12pt");
   });
 
   it("inserts into an empty editor body", async () => {
@@ -550,6 +553,7 @@ describe("reply editor layout", () => {
     insertReplyHtmlAtTop(editorDoc, "<div>reply</div>");
 
     assert.deepStrictEqual(body.children.map(node => node.name), ["aptos"]);
+    assert.equal(body.children[0].style.marginBottom, undefined);
     assert.equal(selection.ranges[0].selectedNode.name, "aptos");
     assert.equal(selection.ranges[0].collapsedToStart, false);
   });

@@ -20,6 +20,12 @@ export function insertReplyHtmlAtTop(editorDoc, fragmentHtml) {
     editorDoc.body.insertBefore(signature, quote);
   }
 
+  // Reserve one line between the current sign-off and quoted correspondence.
+  // Use spacing rather than editable blank paragraphs, which can accumulate.
+  if (quote) {
+    (signature || insertedLastNode).style.marginBottom = "12pt";
+  }
+
   const selection = editorDoc.defaultView?.getSelection?.();
   if (selection) {
     const caretRange = editorDoc.createRange();

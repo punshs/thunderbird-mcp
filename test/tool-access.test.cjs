@@ -86,6 +86,7 @@ const ALL_TOOLS = [
   { name: "getComposeWindow", group: "messages", crud: "read" },
   { name: "updateComposeWindow", group: "messages", crud: "update" },
   { name: "saveComposeWindow", group: "messages", crud: "update" },
+  { name: "closeComposeWindow", group: "messages", crud: "delete" },
   { name: "sendMail", group: "messages", crud: "create" },
   { name: "replyToMessage", group: "messages", crud: "create" },
   { name: "forwardMessage", group: "messages", crud: "create" },

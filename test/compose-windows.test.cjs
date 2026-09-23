@@ -153,3 +153,115 @@ test('native adapter refuses busy windows, unlocks failed edits, and saves with 
   win.gCurrentIdentity.key = 'private';
   assert.equal(host.allowed(id), false);
 });
+
+// These catch data loss from premature close, stale revisions or deleting
+// before closure. Native host operations are the only test doubles.
+test('save-and-close saves first and closes only the selected window', async () => {
+  const { workflow, host, windows } = await fixture();
+  const events = [];
+  host.save = async () => { events.push('save'); return { mode: 'draft' }; };
+  host.close = async id => { events.push('close'); windows.delete(id); };
+  const read = await workflow.get('one');
+  const result = await workflow.close('one', read.revision, 'save');
+  assert.equal(result.closed, true);
+  assert.deepEqual(events, ['save', 'close']);
+  assert.ok(windows.has('two'));
+  await assert.rejects(workflow.get('one'), /accessible/);
+});
+
+test('save-and-close leaves window open on save failure or intervening edits', async () => {
+  for (const fail of [true, false]) {
+    const { workflow, host, windows } = await fixture();
+    host.close = async () => assert.fail('Must not close');
+    host.save = async () => {
+      if (fail) throw new Error('Disk full');
+      windows.get('one').details.body += 'New user edit';
+      return { mode: 'draft' };
+    };
+    const read = await workflow.get('one');
+    await assert.rejects(workflow.close('one', read.revision, 'save'), /Disk full|changed/);
+    assert.ok(windows.has('one'));
+  }
+});
+
+test('discard closes before trashing the saved copy without saving', async () => {
+  const { workflow, host, windows, counts } = await fixture();
+  const events = [];
+  host.prepareDiscard = async () => ({ move: async () => {
+    events.push('trash'); return { status: 'movedToTrash' };
+  } });
+  host.close = async id => { events.push('close'); windows.delete(id); };
+  const read = await workflow.get('one');
+  const result = await workflow.close('one', read.revision, 'discard');
+  assert.equal(result.closed, true);
+  assert.equal(result.savedDraft.status, 'movedToTrash');
+  assert.deepEqual(events, ['close', 'trash']);
+  assert.equal(counts().saved, 0);
+});
+
+test('discard refuses stale revisions, unknown modes, revoked access and failed preflight', async () => {
+  const { workflow, host, windows } = await fixture();
+  host.close = async () => assert.fail('Must not close');
+  const read = await workflow.get('one');
+  await assert.rejects(workflow.close('one', read.revision, 'send'), /mode/);
+  host.prepareDiscard = async () => { throw new Error('No Trash folder'); };
+  await assert.rejects(workflow.close('one', read.revision, 'discard'), /No Trash/);
+  windows.get('one').attachments.push({ id: 9 });
+  await assert.rejects(workflow.close('one', read.revision, 'discard'), /changed/);
+  windows.get('one').accountId = 'denied';
+  await assert.rejects(workflow.close('one', read.revision, 'discard'), /accessible/);
+});
+
+test('discard rechecks after async preflight and never deletes on failed closure', async () => {
+  for (const edit of [true, false]) {
+    const { workflow, host, windows } = await fixture();
+    host.prepareDiscard = async () => {
+      if (edit) windows.get('one').details.subject = 'Human edit';
+      return { move: async () => assert.fail('Must not trash') };
+    };
+    host.close = async () => { throw new Error('Close failed'); };
+    const read = await workflow.get('one');
+    await assert.rejects(workflow.close('one', read.revision, 'discard'), /changed|Close failed/);
+  }
+});
+
+test('discard reports partial failure after closure with recovery information', async () => {
+  const { workflow, host, windows } = await fixture();
+  windows.get('one').draftId = 'draft://one';
+  host.prepareDiscard = async () => ({ move: async () => { throw new Error('Offline'); } });
+  host.close = async id => { windows.delete(id); };
+  const read = await workflow.get('one');
+  const result = await workflow.close('one', read.revision, 'discard');
+  assert.equal(result.closed, true);
+  assert.equal(result.savedDraft.status, 'failed');
+  assert.equal(result.savedDraft.draftId, 'draft://one');
+  assert.match(result.savedDraft.error, /Offline/);
+});
+
+test('native close requires lock, refuses busy window, and waits for its unload event', async () => {
+  const { createThunderbirdComposeHost } = await import(pathToFileURL(target));
+  const listeners = new Map();
+  let calls = 0;
+  const win = {
+    closed: false, document: {}, gCurrentIdentity: { key: 'id1' },
+    gMsgCompose: { compFields: {} }, gWindowLocked: false,
+    ToggleWindowLock(v) { this.gWindowLocked = v; },
+    setTimeout, clearTimeout,
+    addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: name => listeners.delete(name),
+    close() { calls++; this.closed = true; listeners.get('unload')({ target: this.document }); },
+  };
+  const host = createThunderbirdComposeHost({ windows: () => [win],
+    accounts: () => [{ key: 'allowed', identities: [{ key: 'id1' }] }],
+    isAccountAllowed: () => true, token: () => 'one' });
+  host.list();
+  await assert.rejects(host.close('one'), /lock/);
+  win.gSaveOperationInProgress = true;
+  await assert.rejects(host.withLock('one', () => host.close('one')), /busy/);
+  assert.equal(calls, 0);
+  win.gSaveOperationInProgress = false;
+  await host.withLock('one', () => host.close('one'));
+  assert.equal(calls, 1);
+  assert.equal(listeners.size, 0);
+  assert.deepEqual(host.list(), []);
+});

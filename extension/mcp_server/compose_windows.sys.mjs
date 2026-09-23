@@ -46,7 +46,7 @@ export function createComposeWindowWorkflow(host) {
     const task = previous.catch(() => {}).then(() => host.withLock(id, async () => {
       const current = await get(id);
       if (!expectedRevision || current.revision !== expectedRevision) {
-        throw new Error('Draft changed or revision is unknown; read the compose window again before editing or saving');
+        throw new Error('Draft changed or revision is unknown; read the compose window again before editing, saving or closing');
       }
       accessible(id);
       return action(current);
@@ -88,11 +88,53 @@ export function createComposeWindowWorkflow(host) {
     });
   }
 
-  return { list, get, update, save };
+  // Native saving changes bookkeeping, not the content the caller approved.
+  function content(state) {
+    const details = { ...state.details };
+    delete details.isModified;
+    return JSON.stringify({ accountId: state.accountId, details,
+      attachments: state.attachments, originalMessageURI: state.originalMessageURI });
+  }
+
+  async function close(id, expectedRevision, mode) {
+    if (!['save', 'discard'].includes(mode)) throw new Error('Close mode must be save or discard');
+    return mutate(id, expectedRevision, async current => {
+      if (mode === 'save') {
+        const saved = await host.save(id);
+        // save releases the native editing lock. Reacquire and compare before
+        // closing so user/extension changes during an asynchronous save survive.
+        return host.withLock(id, async () => {
+          const after = await get(id);
+          if (content(current) !== content(after) || after.details.isModified === true) {
+            throw new Error('Draft changed during save; saved copy retained and window left open');
+          }
+          await host.close(id);
+          snapshots.delete(id);
+          return { composeId: id, closed: true, mode, saved };
+        });
+      }
+      const prepared = await host.prepareDiscard(current);
+      if ((await get(id)).revision !== expectedRevision) {
+        throw new Error('Draft changed before closing; read the compose window again');
+      }
+      await host.close(id);
+      snapshots.delete(id);
+      // No open editor can autosave/recreate the draft after this point.
+      try {
+        return { composeId: id, closed: true, mode, savedDraft: await prepared.move() };
+      } catch (error) {
+        return { composeId: id, closed: true, mode, savedDraft: {
+          status: 'failed', draftId: current.draftId || null, error: String(error.message || error),
+        } };
+      }
+    });
+  }
+
+  return { list, get, update, save, close };
 }
 
 /** Thunderbird adapter, with native dependencies injected for focused tests. */
-export function createThunderbirdComposeHost({ windows, accounts, isAccountAllowed, compose, tabId, token }) {
+export function createThunderbirdComposeHost({ windows, accounts, isAccountAllowed, compose, tabId, token, prepareDiscard }) {
   const ids = new WeakMap();
   const live = new Map();
   const locked = new Set();
@@ -171,5 +213,34 @@ export function createThunderbirdComposeHost({ windows, accounts, isAccountAllow
     return compose.saveMessage(tabId(win), { mode: 'draft' });
   }
 
-  return { list, allowed, read, withLock, apply, save, token };
+  async function close(id) {
+    const win = windowFor(id);
+    if (!locked.has(id)) throw new Error('Compose close requires the editing lock');
+    if (win.gSendOperationInProgress || win.gSaveOperationInProgress) {
+      throw new Error('Compose window is busy; cannot close');
+    }
+    // Like Thunderbird's windows.remove API, call window.close directly.
+    // Do NOT call ComposeCanClose/RemoveDraft: those prompt or hard-delete.
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        win.clearTimeout(timer);
+        win.removeEventListener('unload', onUnload);
+      };
+      const onUnload = event => {
+        if (event.target !== win.document) return;
+        cleanup();
+        resolve();
+      };
+      const timer = win.setTimeout(() => {
+        cleanup();
+        reject(new Error('Compose window did not close; saved draft was not removed'));
+      }, 5000);
+      win.addEventListener('unload', onUnload);
+      try { win.close(); }
+      catch (error) { cleanup(); reject(error); }
+    });
+    live.delete(id);
+  }
+
+  return { list, allowed, read, withLock, apply, save, close, prepareDiscard, token };
 }

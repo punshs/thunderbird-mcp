@@ -1014,6 +1014,7 @@ const INTERNAL_KEYWORDS = new Set([
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
+    const { setTimeout, clearTimeout } = ChromeUtils.importESModule("resource://gre/modules/Timer.sys.mjs");
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
@@ -1036,6 +1037,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
 
+    const { prepareDraftDiscard, resolveSavedDraft } = ChromeUtils.importESModule(
+      "resource://thunderbird-mcp/mcp_server/draft_discard.sys.mjs"
+    );
     const { createComposeWindowWorkflow, createThunderbirdComposeHost } = ChromeUtils.importESModule(
       "resource://thunderbird-mcp/mcp_server/compose_windows.sys.mjs"
     );
@@ -1273,6 +1277,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             plainTextBody: { type: "string", description: "Entire plain-text body, only for a plain-text compose window" },
           } },
         }, required: ["composeId", "expectedRevision", "changes"] },
+      },
+      {
+        name: "closeComposeWindow", group: "messages", crud: "delete", title: "Close Open Draft",
+        description: "Close one observed compose window. mode save saves to Drafts before closing; mode discard closes without saving and moves its saved draft to Trash if present. Requires latest revision; rejects intervening edits and busy windows. Never sends. Read closed and savedDraft status separately: a Trash failure can leave the window closed and the saved copy intact. No permanent deletion.",
+        inputSchema: { type: "object", additionalProperties: false, properties: {
+          composeId: { type: "string", description: "ID from listComposeWindows" },
+          expectedRevision: { type: "string", description: "Latest revision from getComposeWindow" },
+          mode: { type: "string", enum: ["save", "discard"], description: "Explicitly save-and-close or discard the window and saved draft" },
+        }, required: ["composeId", "expectedRevision", "mode"] },
       },
       {
         name: "saveComposeWindow", group: "messages", crud: "update", title: "Save Open Draft",
@@ -8745,6 +8758,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   accounts: () => [...MailServices.accounts.accounts],
                   isAccountAllowed,
                   compose: nativeCompose,
+                  prepareDiscard: state => prepareDraftDiscard(state, {
+                    resolveDraft: uri => resolveSavedDraft(uri, openFolder),
+                    isDraftFolder: folder => folder.getFlag(Ci.nsMsgFolderFlags.Drafts),
+                    isFolderAllowed: folder => !getAccessibleFolder(folder.URI).error,
+                    findTrashFolder,
+                    moveToTrash: (header, trash) => new Promise((resolve, reject) => {
+                      const timer = setTimeout(() => reject(new Error("Trash move timed out; refresh folders to verify outcome")), 15000);
+                      const listener = {
+                        QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+                        onStartCopy() {}, onProgress() {}, setMessageKey() {}, getMessageId() {},
+                        onStopCopy(status) {
+                          clearTimeout(timer);
+                          if (Components.isSuccessCode(status)) resolve();
+                          else reject(new Error(`Trash move failed: ${status}`));
+                        },
+                      };
+                      try { MailServices.copy.copyMessages(header.folder, [header], trash, true, listener, null, false); }
+                      catch (error) { clearTimeout(timer); reject(error); }
+                    }),
+                  }),
                   tabId: win => context.extension.tabManager.getWrapper(win).id,
                   token: () => Services.uuid.generateUUID().toString(),
                 });
@@ -8761,6 +8794,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getComposeWindows().get(args.composeId);
                 case "updateComposeWindow":
                   return await getComposeWindows().update(args.composeId, args.expectedRevision, args.changes);
+                case "closeComposeWindow":
+                  return await getComposeWindows().close(args.composeId, args.expectedRevision, args.mode);
                 case "saveComposeWindow":
                   return await getComposeWindows().save(args.composeId, args.expectedRevision);
                 case "listAccounts":

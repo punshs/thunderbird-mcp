@@ -73,6 +73,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `listComposeWindows` | List accessible open drafts with unique IDs, revisions, subjects, recipients and attachment metadata. |
 | `getComposeWindow` | Read a particular open draft, including its current body, source-message URI, saved-draft URI and revision. |
 | `updateComposeWindow` | Change selected fields in an existing window; reject stale revisions and preserve untouched fields. Does not send or save. |
+| `closeComposeWindow` | Close the observed revision after saving, or discard and move its saved copy to Trash. Never sends. |
 | `saveComposeWindow` | Save the observed revision to Drafts and leave it open; never sends or queues mail. |
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
@@ -285,6 +286,17 @@ MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
 4. If a draft changed since it was read, reread and reconcile instead of retrying with an old revision. Updates serialize per window and briefly lock its editor; account access is checked again before mutation.
 5. Call `saveComposeWindow` with the latest revision when a saved draft is wanted. It leaves the window open and returns Thunderbird's native save receipt. Saving may change draft metadata; reread before another operation.
 
-Compose IDs/revisions last only for the extension session. Closed or inaccessible windows are rejected. Listing reports per-window read errors rather than hiding a partial result. These tools neither send nor close drafts; listing existing replies helps an assistant avoid creating duplicates, but automatic deduplication is not implemented.
+Compose IDs/revisions last only for the extension session. Closed or inaccessible windows are rejected. Listing reports per-window read errors rather than hiding a partial result. The read, update, and save tools do not close drafts; listing existing replies helps an assistant avoid creating duplicates, but automatic deduplication is not implemented.
 
 Validated with unit tests and an isolated Thunderbird profile containing dummy mail. Activation of this experiment-API add-on may require restarting Thunderbird; save real open drafts before restarting.
+
+To close an open draft, read it first and call `closeComposeWindow` with its
+`composeId`, `expectedRevision`, and an explicit `mode`:
+
+- `save` saves to Drafts, checks for intervening edits, then closes the window.
+- `discard` closes without saving and moves an existing saved copy to Trash.
+
+Check both `closed` and `savedDraft.status` for discard. A failed Trash move is
+reported separately after the window has closed; refresh the folders before
+retrying cleanup. No permanent deletion or sending is performed. See
+[open-draft tool details](docs/open-draft-tools.md).

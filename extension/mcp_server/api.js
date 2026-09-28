@@ -1037,6 +1037,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       "resource://thunderbird-mcp/mcp_server/message_workflows.sys.mjs"
     );
 
+    const { createSavedDraftOpener, openNativeSavedDraft } = ChromeUtils.importESModule(
+      "resource://thunderbird-mcp/mcp_server/saved_draft_open.sys.mjs"
+    );
     const { prepareDraftDiscard, resolveSavedDraft } = ChromeUtils.importESModule(
       "resource://thunderbird-mcp/mcp_server/draft_discard.sys.mjs"
     );
@@ -1251,6 +1254,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           },
           required: ["messageId", "folderPath"],
         },
+      },
+      {
+        name: "openSavedDraft", group: "messages", crud: "update", title: "Reopen Saved Draft",
+        description: "Open an existing message in an accessible Drafts folder for editing through Thunderbird's native draft loader, preserving sender, threading, attachments and format. Reuses an already open matching draft without replacing user edits. Returns composeId, revision and current draft state. Never sends or creates a new-message copy. On a load timeout, inspect listComposeWindows before retrying.",
+        inputSchema: { type: "object", properties: {
+          messageId: { type: "string", description: "Stored draft Message-ID from searchMessages" },
+          folderPath: { type: "string", description: "Drafts folder URI containing the message" },
+        }, required: ["messageId", "folderPath"] },
       },
       {
         name: "listComposeWindows", group: "messages", crud: "read", title: "List Open Drafts",
@@ -8748,7 +8759,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return args;
             }
 
-            let composeWindows;
+            let composeWindows, savedDraftOpener;
             function getComposeWindows() {
               if (!composeWindows) {
                 const nativeCompose = context.extension.apiManager
@@ -8782,12 +8793,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   token: () => Services.uuid.generateUUID().toString(),
                 });
                 composeWindows = createComposeWindowWorkflow(host);
+                savedDraftOpener = createSavedDraftOpener({
+                  resolve(messageId, folderPath) {
+                    const found = findMessage(messageId, folderPath);
+                    if (found.error) throw new Error(found.error);
+                    if (!found.folder.getFlag(Ci.nsMsgFolderFlags.Drafts)) {
+                      throw new Error("Message is not in an accessible Drafts folder");
+                    }
+                    return found.msgHdr;
+                  },
+                  uri: header => header.folder.getUriForMsg(header),
+                  windows: () => [...Services.wm.getEnumerator("msgcompose")],
+                  matches(win, header) {
+                    const uri = win.gMsgCompose?.compFields?.draftId;
+                    if (!uri) return false;
+                    try {
+                      const saved = resolveSavedDraft(uri, openFolder);
+                      return Boolean(saved && saved.folder.URI === header.folder.URI &&
+                        saved.messageKey === header.messageKey && saved.messageId === header.messageId);
+                    } catch { return false; }
+                  },
+                  ready: win => win.composeEditorReady && !win.gSaveOperationInProgress && !win.gSendOperationInProgress,
+                  open: header => openNativeSavedDraft(header, {
+                    getIdentity(hdr) {
+                      const { MailUtils } = ChromeUtils.importESModule("resource:///modules/MailUtils.sys.mjs");
+                      return MailUtils.getIdentityForHeader(hdr, Ci.nsIMsgCompType.Draft)[0];
+                    },
+                    compose: MailServices.compose,
+                    draftType: Ci.nsIMsgCompType.Draft,
+                    defaultFormat: Ci.nsIMsgCompFormat.Default,
+                  }),
+                  snapshot: win => composeWindows.get(host.idForWindow(win)),
+                  focus: win => win.focus(),
+                  wait: ms => new Promise(resolve => setTimeout(resolve, ms)),
+                });
               }
               return composeWindows;
             }
 
             async function callTool(name, args) {
               switch (name) {
+                case "openSavedDraft":
+                  getComposeWindows();
+                  return await savedDraftOpener.open(args.messageId, args.folderPath);
                 case "listComposeWindows":
                   return await getComposeWindows().list();
                 case "getComposeWindow":

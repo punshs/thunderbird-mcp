@@ -82,6 +82,7 @@ const ALL_TOOLS = [
   { name: "getMessages", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
+  { name: "openSavedDraft", group: "messages", crud: "update" },
   { name: "listComposeWindows", group: "messages", crud: "read" },
   { name: "getComposeWindow", group: "messages", crud: "read" },
   { name: "updateComposeWindow", group: "messages", crud: "update" },

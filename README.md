@@ -70,6 +70,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 
 | Tool | Description |
 |------|-------------|
+| `openSavedDraft` | Reopen a saved Drafts message natively for editing, or reuse its existing window without overwriting unsaved edits. |
 | `listComposeWindows` | List accessible open drafts with unique IDs, revisions, subjects, recipients and attachment metadata. |
 | `getComposeWindow` | Read a particular open draft, including its current body, source-message URI, saved-draft URI and revision. |
 | `updateComposeWindow` | Change selected fields in an existing window; reject stale revisions and preserve untouched fields. Does not send or save. |
@@ -280,7 +281,7 @@ MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
 
 ## Editing an open draft
 
-1. Call `listComposeWindows` to identify the existing window, then `getComposeWindow` to read its current content and revision.
+1. To resume a stored draft, call `openSavedDraft` with its Message-ID and Drafts folder URI. Otherwise call `listComposeWindows` to identify the existing window, then `getComposeWindow` to read its current content and revision.
 2. Pass its `composeId`, `expectedRevision`, and a `changes` object to `updateComposeWindow`. Supported fields are `subject`, `to`, `cc`, `bcc`, `body` (HTML windows), and `plainTextBody` (plain-text windows). Address fields are arrays; omitted fields stay unchanged. Sender identity, attachments, threading and compose format cannot be changed by this tool.
 3. A body update replaces the **entire body**, including any signature and quoted correspondence. Preserve those from the read result when revising only the reply text. A subject-only change leaves the body untouched.
 4. If a draft changed since it was read, reread and reconcile instead of retrying with an old revision. Updates serialize per window and briefly lock its editor; account access is checked again before mutation.

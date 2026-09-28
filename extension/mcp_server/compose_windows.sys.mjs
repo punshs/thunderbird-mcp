@@ -92,6 +92,10 @@ export function createComposeWindowWorkflow(host) {
   function content(state) {
     const details = { ...state.details };
     delete details.isModified;
+    // Saving a reopened draft replaces its stored header; Thunderbird may
+    // allocate another WebExtension message ID for the same original URI.
+    // Keep checking originalMessageURI below, which is the stable source.
+    if (details.type === 'draft') delete details.relatedMessageId;
     return JSON.stringify({ accountId: state.accountId, details,
       attachments: state.attachments, originalMessageURI: state.originalMessageURI });
   }
@@ -106,7 +110,7 @@ export function createComposeWindowWorkflow(host) {
         return host.withLock(id, async () => {
           const after = await get(id);
           if (content(current) !== content(after) || after.details.isModified === true) {
-            throw new Error('Draft changed during save; saved copy retained and window left open');
+            throw new Error(`Draft changed during save; saved copy retained and window left open (contentChanged=${content(current) !== content(after)}, modified=${after.details.isModified})`);
           }
           await host.close(id);
           snapshots.delete(id);
@@ -210,7 +214,12 @@ export function createThunderbirdComposeHost({ windows, accounts, isAccountAllow
     // its own save lifecycle owns the window from here. Never invoke send.
     if (!locked.delete(id)) throw new Error('Compose save requires the editing lock');
     win.ToggleWindowLock(false);
-    return compose.saveMessage(tabId(win), { mode: 'draft' });
+    const result = await compose.saveMessage(tabId(win), { mode: 'draft' });
+    // The native receipt can resolve before ComposeProcessDone clears the
+    // editor's modified flag. Let that UI turn finish before the workflow
+    // reacquires its lock and compares content. Later edits still fail closed.
+    await new Promise(resolve => win.setTimeout(resolve, 0));
+    return result;
   }
 
   async function close(id) {
@@ -242,5 +251,6 @@ export function createThunderbirdComposeHost({ windows, accounts, isAccountAllow
     live.delete(id);
   }
 
-  return { list, allowed, read, withLock, apply, save, close, prepareDiscard, token };
+  return { list, allowed, read, withLock, apply, save, close, prepareDiscard, token,
+    idForWindow(win) { list(); return ids.get(win); } };
 }

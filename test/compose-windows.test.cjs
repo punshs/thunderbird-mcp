@@ -128,7 +128,7 @@ test('native adapter refuses busy windows, unlocks failed edits, and saves with 
   const { createThunderbirdComposeHost } = await import(pathToFileURL(target));
   assert.equal(typeof createThunderbirdComposeHost, 'function');
   const locks = [];
-  const win = { closed: false, gCurrentIdentity: { key: 'id1' }, gMsgCompose: { compFields: { draftId: '' }, originalMsgURI: '' }, gWindowLocked: false,
+  const win = { setTimeout, closed: false, gCurrentIdentity: { key: 'id1' }, gMsgCompose: { compFields: { draftId: '' }, originalMsgURI: '' }, gWindowLocked: false,
     ToggleWindowLock(value) { this.gWindowLocked = value; locks.push(value); } };
   const calls = [];
   const compose = {
@@ -264,4 +264,46 @@ test('native close requires lock, refuses busy window, and waits for its unload 
   assert.equal(calls, 1);
   assert.equal(listeners.size, 0);
   assert.deepEqual(host.list(), []);
+});
+
+test('save-and-close tolerates native draft message-manager ID renewal but preserves source URI check', async () => {
+  for (const changeSource of [false, true]) {
+    const { workflow, host, windows } = await fixture();
+    const state = windows.get('one');
+    state.details.type = 'draft';
+    state.details.relatedMessageId = 42;
+    state.originalMessageURI = 'mailbox-message://test/Drafts#1';
+    let closed = false;
+    host.save = async () => {
+      state.details.relatedMessageId = 43;
+      if (changeSource) state.originalMessageURI = 'mailbox-message://test/Inbox#99';
+      return { mode: 'draft', messages: [{ id: 43 }] };
+    };
+    host.close = async () => { closed = true; windows.delete('one'); };
+    const before = await workflow.get('one');
+    if (changeSource) {
+      await assert.rejects(workflow.close('one', before.revision, 'save'), /changed during save/);
+      assert.equal(closed, false);
+    } else {
+      assert.equal((await workflow.close('one', before.revision, 'save')).closed, true);
+    }
+  }
+});
+
+test('native save waits a UI turn for ComposeProcessDone to clear modified state', async () => {
+  const { createThunderbirdComposeHost } = await import(pathToFileURL(target));
+  let modified = true;
+  const win = { setTimeout, closed: false, gCurrentIdentity: { key: 'id1' }, gMsgCompose: { compFields: {} },
+    ToggleWindowLock(value) { this.gWindowLocked = value; } };
+  const host = createThunderbirdComposeHost({ windows: () => [win],
+    accounts: () => [{ key: 'allowed', identities: [{ key: 'id1' }] }],
+    isAccountAllowed: () => true, tabId: () => 1, token: () => 'id',
+    compose: { saveMessage: async () => {
+      setTimeout(() => { modified = false; }, 0);
+      return { mode: 'draft' };
+    } },
+  });
+  const [id] = host.list();
+  await host.withLock(id, () => host.save(id));
+  assert.equal(modified, false);
 });
